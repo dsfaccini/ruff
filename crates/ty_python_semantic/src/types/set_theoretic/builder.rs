@@ -45,6 +45,7 @@ use crate::types::{
     TypeVarBoundOrConstraints, UnionType,
 };
 use crate::{Db, FxOrderMap, FxOrderSet};
+use bitflags::bitflags;
 use smallvec::SmallVec;
 
 /// Extract `(core, guard)` from truthiness-guarded intersections.
@@ -128,15 +129,7 @@ fn merge_truthiness_guarded_pair<'db>(
     }
 }
 
-/// Return `true` if union normalization may ask the relation layer about this pair.
-///
-/// Generic protocol interface construction can recurse through ever-growing specializations, but
-/// non-generic protocol cycles are handled by Salsa cycle recovery.
-fn can_use_relation_based_simplification(db: &dyn Db, left: Type, right: Type) -> bool {
-    !is_generic_protocol_instance(db, left) && !is_generic_protocol_instance(db, right)
-}
-
-fn is_generic_protocol_instance(db: &dyn Db, ty: Type) -> bool {
+fn is_generic_protocol_instance<'db>(db: &'db dyn Db, ty: Type<'db>) -> bool {
     if !matches!(ty, Type::ProtocolInstance(_)) {
         return false;
     }
@@ -146,20 +139,54 @@ fn is_generic_protocol_instance(db: &dyn Db, ty: Type) -> bool {
         .is_some_and(|(_, specialization)| specialization.is_some())
 }
 
-fn is_redundant_for_union_simplification<'db>(
+bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct UnionBuilderFlags: u8 {
+        /// Union normalization may ask the type-relation layer for redundancy and subtype checks.
+        const RELATION_BASED_SIMPLIFICATION = 1 << 0;
+    }
+}
+
+impl Default for UnionBuilderFlags {
+    fn default() -> Self {
+        Self::RELATION_BASED_SIMPLIFICATION
+    }
+}
+
+/// Return `true` if union normalization may ask the relation layer about this pair.
+///
+/// Generic protocol interface construction can recurse through ever-growing specializations
+/// when a generic protocol is one side of the relation. Non-generic protocol cycles are
+/// handled by Salsa cycle recovery, and protocol-interface construction disables relation-based
+/// union simplification before nested generic protocols can force ever-growing interfaces.
+fn can_use_relation_based_simplification<'db>(
     db: &'db dyn Db,
+    flags: UnionBuilderFlags,
     left: Type<'db>,
     right: Type<'db>,
 ) -> bool {
-    can_use_relation_based_simplification(db, left, right) && left.is_redundant_with(db, right)
+    flags.contains(UnionBuilderFlags::RELATION_BASED_SIMPLIFICATION)
+        && !is_generic_protocol_instance(db, left)
+        && !is_generic_protocol_instance(db, right)
+}
+
+fn is_redundant_for_union_simplification<'db>(
+    db: &'db dyn Db,
+    flags: UnionBuilderFlags,
+    left: Type<'db>,
+    right: Type<'db>,
+) -> bool {
+    can_use_relation_based_simplification(db, flags, left, right)
+        && left.is_redundant_with(db, right)
 }
 
 fn is_subtype_for_union_simplification<'db>(
     db: &'db dyn Db,
+    flags: UnionBuilderFlags,
     left: Type<'db>,
     right: Type<'db>,
 ) -> bool {
-    can_use_relation_based_simplification(db, left, right) && left.is_subtype_of(db, right)
+    can_use_relation_based_simplification(db, flags, left, right) && left.is_subtype_of(db, right)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,13 +269,21 @@ impl<'db> UnionElement<'db> {
     }
 
     /// Try reducing this `UnionElement` given the presence in the same union of `other_type`.
-    fn try_reduce(&mut self, db: &'db dyn Db, other_type: Type<'db>) -> ReduceResult<'db> {
+    fn try_reduce(
+        &mut self,
+        db: &'db dyn Db,
+        flags: UnionBuilderFlags,
+        other_type: Type<'db>,
+    ) -> ReduceResult<'db> {
         let mut other_type_negated_cache = None;
         let mut other_type_negated =
             || *other_type_negated_cache.get_or_insert_with(|| other_type.negate(db));
 
         let mut collapse = false;
         let mut ignore = false;
+        let is_redundant =
+            |left, right| is_redundant_for_union_simplification(db, flags, left, right);
+        let is_subtype = |left, right| is_subtype_for_union_simplification(db, flags, left, right);
 
         // A closure called for each element in a set of literals
         // to determine whether the element should be retained in the set.
@@ -269,15 +304,15 @@ impl<'db> UnionElement<'db> {
         // both `ignore` and `collapse` are `false`. If either is `true`,
         // we skip the expensive redundancy check and return `true`.
         let mut should_retain_type = |ty| {
-            if ignore || is_redundant_for_union_simplification(db, other_type, ty) {
+            if ignore || is_redundant(other_type, ty) {
                 ignore = true;
                 return true;
             }
-            if collapse || is_subtype_for_union_simplification(db, other_type_negated(), ty) {
+            if collapse || is_subtype(other_type_negated(), ty) {
                 collapse = true;
                 return true;
             }
-            !is_redundant_for_union_simplification(db, ty, other_type)
+            !is_redundant(ty, other_type)
         };
 
         let should_keep = match self {
@@ -290,7 +325,7 @@ impl<'db> UnionElement<'db> {
                 } else {
                     let (literal, promotable) = literals.first().unwrap();
                     let ty = Type::from(LiteralValueType::new(*literal, *promotable));
-                    !is_redundant_for_union_simplification(db, ty, other_type)
+                    !is_redundant(ty, other_type)
                 }
             }
             UnionElement::StringLiterals(literals) => {
@@ -302,7 +337,7 @@ impl<'db> UnionElement<'db> {
                 } else {
                     let (literal, promotable) = literals.first().unwrap();
                     let ty = Type::from(LiteralValueType::new(*literal, *promotable));
-                    !is_redundant_for_union_simplification(db, ty, other_type)
+                    !is_redundant(ty, other_type)
                 }
             }
             UnionElement::BytesLiterals(literals) => {
@@ -314,7 +349,7 @@ impl<'db> UnionElement<'db> {
                 } else {
                     let (literal, promotable) = literals.first().unwrap();
                     let ty = Type::from(LiteralValueType::new(*literal, *promotable));
-                    !is_redundant_for_union_simplification(db, ty, other_type)
+                    !is_redundant(ty, other_type)
                 }
             }
             UnionElement::EnumLiterals {
@@ -332,7 +367,7 @@ impl<'db> UnionElement<'db> {
                 } else {
                     let (literal, promotable) = literals.first().unwrap();
                     let ty = Type::from(LiteralValueType::new(*literal, *promotable));
-                    !is_redundant_for_union_simplification(db, ty, other_type)
+                    !is_redundant(ty, other_type)
                 }
             }
             UnionElement::Type(existing) => return ReduceResult::Type(*existing),
@@ -376,6 +411,7 @@ const MAX_NON_RECURSIVE_UNION_ENUM_LITERALS: usize = 8192;
 pub(crate) struct UnionBuilder<'db> {
     elements: Vec<UnionElement<'db>>,
     db: &'db dyn Db,
+    flags: UnionBuilderFlags,
     unpack_aliases: bool,
     /// This is enabled when joining types in a `cycle_recovery` function.
     /// Since a cycle cannot be created within a `cycle_recovery` function,
@@ -445,6 +481,7 @@ impl<'db> UnionBuilder<'db> {
         Self {
             db,
             elements: vec![],
+            flags: UnionBuilderFlags::default(),
             unpack_aliases: true,
             cycle_recovery: false,
             recursively_defined: RecursivelyDefined::No,
@@ -460,7 +497,15 @@ impl<'db> UnionBuilder<'db> {
         self.cycle_recovery = val;
         if self.cycle_recovery {
             self.unpack_aliases = false;
+            self.flags
+                .remove(UnionBuilderFlags::RELATION_BASED_SIMPLIFICATION);
         }
+        self
+    }
+
+    pub(crate) fn relation_based_simplification(mut self, val: bool) -> Self {
+        self.flags
+            .set(UnionBuilderFlags::RELATION_BASED_SIMPLIFICATION, val);
         self
     }
 
@@ -525,8 +570,13 @@ impl<'db> UnionBuilder<'db> {
             }
         };
 
+        let db = self.db;
+        let flags = self.flags;
         let mut ty_negated_cache = None;
-        let mut ty_negated = || *ty_negated_cache.get_or_insert_with(|| ty.negate(self.db));
+        let mut ty_negated = || *ty_negated_cache.get_or_insert_with(|| ty.negate(db));
+        let is_redundant =
+            |left, right| is_redundant_for_union_simplification(db, flags, left, right);
+        let is_subtype = |left, right| is_subtype_for_union_simplification(db, flags, left, right);
 
         match ty {
             Type::Union(union) => {
@@ -587,20 +637,14 @@ impl<'db> UnionBuilder<'db> {
                                 UnionElement::Type(existing) => {
                                     // e.g. `existing` could be `Literal[""] & Any`,
                                     // and `ty` could be `Literal[""]`
-                                    if is_redundant_for_union_simplification(self.db, ty, *existing)
-                                    {
+                                    if is_redundant(ty, *existing) {
                                         return;
                                     }
-                                    if is_redundant_for_union_simplification(self.db, *existing, ty)
-                                    {
+                                    if is_redundant(*existing, ty) {
                                         to_remove = Some(index);
                                         continue;
                                     }
-                                    if is_subtype_for_union_simplification(
-                                        self.db,
-                                        ty_negated(),
-                                        *existing,
-                                    ) {
+                                    if is_subtype(ty_negated(), *existing) {
                                         // The type that includes both this new element, and its negation
                                         // (or a supertype of its negation), must be simply `object`.
                                         self.collapse_to_object();
@@ -638,22 +682,16 @@ impl<'db> UnionBuilder<'db> {
                                     continue;
                                 }
                                 UnionElement::Type(existing) => {
-                                    if is_redundant_for_union_simplification(self.db, ty, *existing)
-                                    {
+                                    if is_redundant(ty, *existing) {
                                         return;
                                     }
                                     // e.g. `existing` could be `Literal[b""] & Any`,
                                     // and `ty` could be `Literal[b""]`
-                                    if is_redundant_for_union_simplification(self.db, *existing, ty)
-                                    {
+                                    if is_redundant(*existing, ty) {
                                         to_remove = Some(index);
                                         continue;
                                     }
-                                    if is_subtype_for_union_simplification(
-                                        self.db,
-                                        ty_negated(),
-                                        *existing,
-                                    ) {
+                                    if is_subtype(ty_negated(), *existing) {
                                         // The type that includes both this new element, and its negation
                                         // (or a supertype of its negation), must be simply `object`.
                                         self.collapse_to_object();
@@ -693,22 +731,16 @@ impl<'db> UnionBuilder<'db> {
                                     continue;
                                 }
                                 UnionElement::Type(existing) => {
-                                    if is_redundant_for_union_simplification(self.db, ty, *existing)
-                                    {
+                                    if is_redundant(ty, *existing) {
                                         return;
                                     }
                                     // e.g. `existing` could be `Literal[1] & Any`,
                                     // and `ty` could be `Literal[1]`
-                                    if is_redundant_for_union_simplification(self.db, *existing, ty)
-                                    {
+                                    if is_redundant(*existing, ty) {
                                         to_remove = Some(index);
                                         continue;
                                     }
-                                    if is_subtype_for_union_simplification(
-                                        self.db,
-                                        ty_negated(),
-                                        *existing,
-                                    ) {
+                                    if is_subtype(ty_negated(), *existing) {
                                         // The type that includes both this new element, and its negation
                                         // (or a supertype of its negation), must be simply `object`.
                                         self.collapse_to_object();
@@ -775,22 +807,16 @@ impl<'db> UnionBuilder<'db> {
                                     continue;
                                 }
                                 UnionElement::Type(existing) => {
-                                    if is_redundant_for_union_simplification(self.db, ty, *existing)
-                                    {
+                                    if is_redundant(ty, *existing) {
                                         return;
                                     }
                                     // e.g. `existing` could be `Literal[Foo.X] & Any`,
                                     // and `ty` could be `Literal[Foo.X]`
-                                    if is_redundant_for_union_simplification(self.db, *existing, ty)
-                                    {
+                                    if is_redundant(*existing, ty) {
                                         to_remove = Some(index);
                                         continue;
                                     }
-                                    if is_subtype_for_union_simplification(
-                                        self.db,
-                                        ty_negated(),
-                                        *existing,
-                                    ) {
+                                    if is_subtype(ty_negated(), *existing) {
                                         // The type that includes both this new element, and its negation
                                         // (or a supertype of its negation), must be simply `object`.
                                         self.collapse_to_object();
@@ -853,12 +879,17 @@ impl<'db> UnionBuilder<'db> {
         // shouldn't try to simplify aliases out of the union, because that will require
         // unpacking them.
         let should_simplify_full = !matches!(ty, Type::TypeAlias(_)) && !self.cycle_recovery;
+        let db = self.db;
+        let flags = self.flags;
+        let is_redundant =
+            |left, right| is_redundant_for_union_simplification(db, flags, left, right);
+        let is_subtype = |left, right| is_subtype_for_union_simplification(db, flags, left, right);
 
         let mut ty_negated: Option<Type> = None;
         let mut to_remove = SmallVec::<[usize; 2]>::new();
 
         for (i, element) in self.elements.iter_mut().enumerate() {
-            let element_type = match element.try_reduce(self.db, ty) {
+            let element_type = match element.try_reduce(self.db, self.flags, ty) {
                 ReduceResult::KeepIf(keep) => {
                     if !keep {
                         to_remove.push(i);
@@ -904,17 +935,17 @@ impl<'db> UnionBuilder<'db> {
             }
 
             if should_simplify_full && !matches!(element_type, Type::TypeAlias(_)) {
-                if is_redundant_for_union_simplification(self.db, ty, element_type) {
+                if is_redundant(ty, element_type) {
                     return;
                 }
 
-                if is_redundant_for_union_simplification(self.db, element_type, ty) {
+                if is_redundant(element_type, ty) {
                     to_remove.push(i);
                     continue;
                 }
 
-                let negated = ty_negated.get_or_insert_with(|| ty.negate(self.db));
-                if is_subtype_for_union_simplification(self.db, *negated, element_type) {
+                let negated = ty_negated.get_or_insert_with(|| ty.negate(db));
+                if is_subtype(*negated, element_type) {
                     // We add `ty` to the union. We just checked that `~ty` is a subtype of an
                     // existing `element`. This also means that `~ty | ty` is a subtype of
                     // `element | ty`, because both elements in the first union are subtypes of
