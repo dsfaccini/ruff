@@ -578,6 +578,43 @@ impl Project {
         index.remove(file);
     }
 
+    /// Removes all indexed project files under `path`.
+    ///
+    /// This is a no-op if the project files are still lazily indexed.
+    #[tracing::instrument(level = "debug", skip(self, db))]
+    pub(crate) fn remove_files_under(self, db: &mut dyn Db, path: &SystemPath) {
+        let path = SystemPath::absolute(path, db.system().current_directory());
+
+        if self.file_set(db).is_lazy() {
+            return;
+        }
+
+        let files_to_remove = {
+            let files = self.files(db);
+            files
+                .iter()
+                .copied()
+                .filter(|file| {
+                    file.path(db)
+                        .as_system_path()
+                        .is_some_and(|file_path| file_path.starts_with(&path))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        if files_to_remove.is_empty() {
+            return;
+        }
+
+        let Some(mut index) = IndexedFiles::indexed_mut(db, self) else {
+            return;
+        };
+
+        for file in files_to_remove {
+            index.remove(file);
+        }
+    }
+
     pub fn add_file(self, db: &mut dyn Db, file: File) {
         tracing::debug!(
             "Adding file `{}` to project `{}`",

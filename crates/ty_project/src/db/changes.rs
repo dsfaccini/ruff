@@ -8,7 +8,7 @@ use crate::walk::ProjectFilesWalker;
 use ruff_db::Db as _;
 use ruff_db::file_revision::FileRevision;
 use ruff_db::files::{File, FileRootKind, Files};
-use ruff_db::system::SystemPath;
+use ruff_db::system::{SystemPath, deduplicate_nested_paths};
 use rustc_hash::FxHashSet;
 use salsa::Setter;
 use ty_python_core::program::{FallibleStrategy, Program};
@@ -40,6 +40,8 @@ impl ProjectDatabase {
     ) -> ChangeResult {
         let project = self.project();
         let project_root = project.root(self).to_path_buf();
+        let project_ty_toml = project_root.join("ty.toml");
+        let project_pyproject_toml = project_root.join("pyproject.toml");
         let config_file_override =
             project_options_overrides.and_then(|options| options.config_file_override.clone());
         let program = Program::get(self);
@@ -57,6 +59,9 @@ impl ProjectDatabase {
         // Deduplicate the `sync` calls. Many file watchers emit multiple events for the same path.
         let mut synced_files = FxHashSet::default();
         let mut sync_recursively = BTreeSet::default();
+        // A non-file delete may be a deleted directory or an ambiguous LSP delete for a path
+        // that no longer exists. Handle it recursively to keep Salsa's file state in sync.
+        let mut recursive_deletes = BTreeSet::default();
 
         for change in changes {
             tracing::debug!("Handling file watcher change event: {:?}", change);
@@ -162,10 +167,7 @@ impl ProjectDatabase {
                 ChangeEvent::Deleted { kind, path } => {
                     let is_file = match kind {
                         DeletedKind::File => true,
-                        DeletedKind::Directory => {
-                            // file watchers emit an event for every deleted file. No need to scan the entire dir.
-                            continue;
-                        }
+                        DeletedKind::Directory => false,
                         DeletedKind::Any => self
                             .files
                             .try_system(self, path)
@@ -181,7 +183,7 @@ impl ProjectDatabase {
                             project.remove_file(self, file);
                         }
                     } else {
-                        sync_recursively.insert(path.clone());
+                        recursive_deletes.insert(path.clone());
 
                         if custom_stdlib_versions_path
                             .as_ref()
@@ -190,23 +192,24 @@ impl ProjectDatabase {
                             result.custom_stdlib_changed = true;
                         }
 
-                        let directory_included = project.is_directory_included(self, path);
-
-                        if directory_included || path == &project_root {
-                            // TODO: Shouldn't it be enough to simply traverse the project files and remove all
-                            // that start with the given path?
+                        if config_file_override
+                            .as_ref()
+                            .is_some_and(|config_file| config_file.starts_with(path))
+                            || project_ty_toml.starts_with(path)
+                            || project_pyproject_toml.starts_with(path)
+                            || project
+                                .metadata(self)
+                                .extra_configuration_paths()
+                                .iter()
+                                .any(|config_file| config_file.starts_with(path))
+                        {
                             tracing::debug!(
-                                "Reload project because of a path that could have been a directory."
+                                "Reload project because a configuration file may have been deleted."
                             );
-
-                            // Perform a full-reload in case the deleted directory contained the pyproject.toml.
-                            // We may want to make this more clever in the future, to e.g. iterate over the
-                            // indexed files and remove the once that start with the same path, unless
-                            // the deleted path is the project configuration.
                             result.project_changed = true;
-                        } else if !directory_included {
+                        } else if !project.is_directory_included(self, path) {
                             tracing::debug!(
-                                "Skipping reload because directory '{path}' isn't included in the project"
+                                "Skipping reload because deleted path '{path}' isn't included in the project"
                             );
                         }
                     }
@@ -226,24 +229,19 @@ impl ProjectDatabase {
                     result.project_changed = true;
                     Files::sync_all(self);
                     sync_recursively.clear();
+                    recursive_deletes.clear();
                     break;
                 }
             }
         }
 
-        let sync_recursively = sync_recursively.into_iter();
-        let mut last = None;
-
-        for path in sync_recursively {
-            // Avoid re-syncing paths that are sub-paths of each other.
-            if let Some(last) = &last {
-                if path.starts_with(last) {
-                    continue;
-                }
-            }
-
+        for path in deduplicate_nested_paths(sync_recursively) {
             Files::sync_recursively(self, &path);
-            last = Some(path);
+        }
+
+        for path in deduplicate_nested_paths(recursive_deletes) {
+            Files::sync_recursively(self, &path);
+            project.remove_files_under(self, &path);
         }
 
         if result.project_changed {
@@ -363,5 +361,72 @@ impl ProjectDatabase {
         project.replace_index_diagnostics(self, diagnostics);
 
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ruff_db::files::system_path_to_file;
+    use ruff_db::system::SystemPathBuf;
+    use ruff_db::system::{SystemPath, TestSystem};
+    use ruff_python_ast::name::Name;
+
+    use crate::db::Db as _;
+    use crate::watch::{ChangeEvent, DeletedKind};
+    use crate::{ProjectDatabase, ProjectMetadata};
+
+    #[test]
+    fn recursive_delete_syncs_and_removes_indexed_descendants() -> anyhow::Result<()> {
+        let system = TestSystem::default();
+        system
+            .memory_file_system()
+            .write_file_all(SystemPath::new("/project/bar.py"), "")?;
+        system
+            .memory_file_system()
+            .write_file_all(SystemPath::new("/project/sub/__init__.py"), "")?;
+        system
+            .memory_file_system()
+            .write_file_all(SystemPath::new("/project/sub/a.py"), "")?;
+
+        let metadata =
+            ProjectMetadata::new(Name::new_static("project"), SystemPathBuf::from("/project"));
+        let mut db = ProjectDatabase::use_defaults(metadata, system.clone());
+
+        let bar = system_path_to_file(&db, SystemPath::new("/project/bar.py"))?;
+        let init = system_path_to_file(&db, SystemPath::new("/project/sub/__init__.py"))?;
+        let a = system_path_to_file(&db, SystemPath::new("/project/sub/a.py"))?;
+
+        assert!(db.project().files(&db).contains(&bar));
+        assert!(db.project().files(&db).contains(&init));
+        assert!(db.project().files(&db).contains(&a));
+
+        system
+            .memory_file_system()
+            .remove_file(SystemPath::new("/project/sub/__init__.py"))?;
+        system
+            .memory_file_system()
+            .remove_file(SystemPath::new("/project/sub/a.py"))?;
+        system
+            .memory_file_system()
+            .remove_directory(SystemPath::new("/project/sub"))?;
+
+        let result = db.apply_changes(
+            &[ChangeEvent::Deleted {
+                path: SystemPathBuf::from("/project/sub"),
+                kind: DeletedKind::Directory,
+            }],
+            None,
+        );
+
+        assert!(!result.project_changed());
+        assert!(!init.exists(&db));
+        assert!(!a.exists(&db));
+
+        let files = db.project().files(&db);
+        assert!(files.contains(&bar));
+        assert!(!files.contains(&init));
+        assert!(!files.contains(&a));
+
+        Ok(())
     }
 }
