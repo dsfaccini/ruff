@@ -128,19 +128,14 @@ fn merge_truthiness_guarded_pair<'db>(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UnionSimplification {
     /// Normalize using only structural operations that cannot call back into the type-relation
     /// layer.
     Structural,
     /// Normalize using type-relation checks such as redundancy and subtyping.
+    #[default]
     TypeRelations,
-}
-
-impl Default for UnionSimplification {
-    fn default() -> Self {
-        Self::TypeRelations
-    }
 }
 
 impl UnionSimplification {
