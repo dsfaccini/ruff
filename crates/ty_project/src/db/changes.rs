@@ -8,7 +8,7 @@ use crate::walk::ProjectFilesWalker;
 use ruff_db::Db as _;
 use ruff_db::file_revision::FileRevision;
 use ruff_db::files::{File, FileRootKind, Files};
-use ruff_db::system::{SystemPath, deduplicate_nested_paths};
+use ruff_db::system::{SystemPath, SystemPathBuf, deduplicate_nested_paths};
 use rustc_hash::FxHashSet;
 use salsa::Setter;
 use ty_python_core::program::{FallibleStrategy, Program};
@@ -40,10 +40,13 @@ impl ProjectDatabase {
     ) -> ChangeResult {
         let project = self.project();
         let project_root = project.root(self).to_path_buf();
-        let project_ty_toml = project_root.join("ty.toml");
-        let project_pyproject_toml = project_root.join("pyproject.toml");
         let config_file_override =
             project_options_overrides.and_then(|options| options.config_file_override.clone());
+        let project_reload_paths = project_reload_paths(
+            &project_root,
+            config_file_override.as_ref(),
+            project.metadata(self).extra_configuration_paths(),
+        );
         let program = Program::get(self);
         let custom_stdlib_versions_path = program
             .custom_stdlib_search_path(self)
@@ -62,27 +65,22 @@ impl ProjectDatabase {
         // A non-file delete may be a deleted directory or an ambiguous LSP delete for a path
         // that no longer exists. Handle it recursively to keep Salsa's file state in sync.
         let mut recursive_deletes = BTreeSet::default();
+        let mut reload_project_files = false;
 
         for change in changes {
             tracing::debug!("Handling file watcher change event: {:?}", change);
 
             if let Some(path) = change.system_path() {
-                if let Some(config_file) = &config_file_override {
-                    if config_file.as_path() == path {
-                        File::sync_path(self, path);
-                        result.project_changed = true;
+                if is_project_reload_path(path, &project_reload_paths) {
+                    File::sync_path(self, path);
+                    result.project_changed = true;
 
-                        continue;
-                    }
+                    continue;
                 }
 
-                if matches!(
-                    path.file_name(),
-                    Some(".gitignore" | ".ignore" | "ty.toml" | "pyproject.toml")
-                ) {
+                if is_ignore_file(path) {
                     File::sync_path(self, path);
-                    // Changes to ignore files or settings can change the project structure or add/remove files.
-                    result.project_changed = true;
+                    reload_project_files = true;
 
                     continue;
                 }
@@ -192,17 +190,7 @@ impl ProjectDatabase {
                             result.custom_stdlib_changed = true;
                         }
 
-                        if config_file_override
-                            .as_ref()
-                            .is_some_and(|config_file| config_file.starts_with(path))
-                            || project_ty_toml.starts_with(path)
-                            || project_pyproject_toml.starts_with(path)
-                            || project
-                                .metadata(self)
-                                .extra_configuration_paths()
-                                .iter()
-                                .any(|config_file| config_file.starts_with(path))
-                        {
+                        if directory_contains_project_reload_path(path, &project_reload_paths) {
                             tracing::debug!(
                                 "Reload project because a configuration file may have been deleted."
                             );
@@ -308,11 +296,22 @@ impl ProjectDatabase {
                     tracing::error!(
                         "Failed to load project, keeping old project configuration: {error}"
                     );
+                    if reload_project_files {
+                        project.reload_files(self);
+                    }
                 }
             }
 
             return result;
-        } else if result.custom_stdlib_changed {
+        }
+
+        if reload_project_files {
+            project.reload_files(self);
+            // A full project-file reload supersedes incremental discovery of newly added paths.
+            added_paths.clear();
+        }
+
+        if result.custom_stdlib_changed {
             match project.metadata(self).to_program_settings(
                 self.system(),
                 self.vendored(),
@@ -364,6 +363,47 @@ impl ProjectDatabase {
     }
 }
 
+/// Returns the configuration paths that can change project metadata.
+///
+/// An explicit config-file override replaces normal root config discovery.
+fn project_reload_paths(
+    project_root: &SystemPath,
+    config_file_override: Option<&SystemPathBuf>,
+    extra_configuration_paths: &[SystemPathBuf],
+) -> Vec<SystemPathBuf> {
+    let discovered_config_paths = if config_file_override.is_some() { 1 } else { 2 };
+    let mut paths = Vec::with_capacity(discovered_config_paths + extra_configuration_paths.len());
+
+    if let Some(config_file_override) = config_file_override {
+        paths.push(config_file_override.clone());
+    } else {
+        paths.push(project_root.join("ty.toml"));
+        paths.push(project_root.join("pyproject.toml"));
+    }
+
+    paths.extend(extra_configuration_paths.iter().cloned());
+    paths
+}
+
+fn is_project_reload_path(path: &SystemPath, project_reload_paths: &[SystemPathBuf]) -> bool {
+    project_reload_paths
+        .iter()
+        .any(|reload_path| reload_path.as_path() == path)
+}
+
+fn directory_contains_project_reload_path(
+    directory: &SystemPath,
+    project_reload_paths: &[SystemPathBuf],
+) -> bool {
+    project_reload_paths
+        .iter()
+        .any(|reload_path| reload_path.starts_with(directory))
+}
+
+fn is_ignore_file(path: &SystemPath) -> bool {
+    matches!(path.file_name(), Some(".gitignore" | ".ignore"))
+}
+
 #[cfg(test)]
 mod tests {
     use ruff_db::files::system_path_to_file;
@@ -372,25 +412,48 @@ mod tests {
     use ruff_python_ast::name::Name;
 
     use crate::db::Db as _;
-    use crate::watch::{ChangeEvent, DeletedKind};
+    use crate::metadata::options::{Options, ProjectOptionsOverrides};
+    use crate::watch::{ChangeEvent, ChangedKind, DeletedKind};
     use crate::{ProjectDatabase, ProjectMetadata};
+
+    fn project_db(system: TestSystem) -> ProjectDatabase {
+        let metadata =
+            ProjectMetadata::new(Name::new_static("project"), SystemPathBuf::from("/project"));
+        ProjectDatabase::use_defaults(metadata, system)
+    }
+
+    fn write_file(
+        system: &TestSystem,
+        path: &'static str,
+        contents: &str,
+    ) -> ruff_db::system::Result<()> {
+        system
+            .memory_file_system()
+            .write_file_all(SystemPath::new(path), contents)
+    }
+
+    fn changed(path: &'static str) -> ChangeEvent {
+        ChangeEvent::Changed {
+            path: SystemPathBuf::from(path),
+            kind: ChangedKind::FileContent,
+        }
+    }
+
+    fn deleted_directory(path: &'static str) -> ChangeEvent {
+        ChangeEvent::Deleted {
+            path: SystemPathBuf::from(path),
+            kind: DeletedKind::Directory,
+        }
+    }
 
     #[test]
     fn recursive_delete_syncs_and_removes_indexed_descendants() -> anyhow::Result<()> {
         let system = TestSystem::default();
-        system
-            .memory_file_system()
-            .write_file_all(SystemPath::new("/project/bar.py"), "")?;
-        system
-            .memory_file_system()
-            .write_file_all(SystemPath::new("/project/sub/__init__.py"), "")?;
-        system
-            .memory_file_system()
-            .write_file_all(SystemPath::new("/project/sub/a.py"), "")?;
+        write_file(&system, "/project/bar.py", "")?;
+        write_file(&system, "/project/sub/__init__.py", "")?;
+        write_file(&system, "/project/sub/a.py", "")?;
 
-        let metadata =
-            ProjectMetadata::new(Name::new_static("project"), SystemPathBuf::from("/project"));
-        let mut db = ProjectDatabase::use_defaults(metadata, system.clone());
+        let mut db = project_db(system.clone());
 
         let bar = system_path_to_file(&db, SystemPath::new("/project/bar.py"))?;
         let init = system_path_to_file(&db, SystemPath::new("/project/sub/__init__.py"))?;
@@ -410,13 +473,7 @@ mod tests {
             .memory_file_system()
             .remove_directory(SystemPath::new("/project/sub"))?;
 
-        let result = db.apply_changes(
-            &[ChangeEvent::Deleted {
-                path: SystemPathBuf::from("/project/sub"),
-                kind: DeletedKind::Directory,
-            }],
-            None,
-        );
+        let result = db.apply_changes(&[deleted_directory("/project/sub")], None);
 
         assert!(!result.project_changed());
         assert!(!init.exists(&db));
@@ -426,6 +483,104 @@ mod tests {
         assert!(files.contains(&bar));
         assert!(!files.contains(&init));
         assert!(!files.contains(&a));
+
+        Ok(())
+    }
+
+    #[test]
+    fn active_project_config_change_reloads_project() -> anyhow::Result<()> {
+        let system = TestSystem::default();
+        write_file(&system, "/project/pyproject.toml", "")?;
+
+        let mut db = project_db(system);
+
+        let result = db.apply_changes(&[changed("/project/pyproject.toml")], None);
+
+        assert!(result.project_changed());
+
+        Ok(())
+    }
+
+    #[test]
+    fn nested_project_config_change_does_not_reload_project() -> anyhow::Result<()> {
+        let system = TestSystem::default();
+        write_file(&system, "/project/pkg/pyproject.toml", "")?;
+
+        let mut db = project_db(system);
+
+        let result = db.apply_changes(&[changed("/project/pkg/pyproject.toml")], None);
+
+        assert!(!result.project_changed());
+
+        Ok(())
+    }
+
+    #[test]
+    fn config_file_override_limits_project_reload_paths() -> anyhow::Result<()> {
+        let system = TestSystem::default();
+        write_file(&system, "/config/ty.toml", "")?;
+        write_file(&system, "/project/pyproject.toml", "")?;
+
+        let mut db = project_db(system);
+        let overrides = ProjectOptionsOverrides::new(
+            Some(SystemPathBuf::from("/config/ty.toml")),
+            Options::default(),
+        );
+
+        let result = db.apply_changes(&[changed("/project/pyproject.toml")], Some(&overrides));
+
+        assert!(!result.project_changed());
+
+        let result = db.apply_changes(&[changed("/config/ty.toml")], Some(&overrides));
+
+        assert!(result.project_changed());
+
+        Ok(())
+    }
+
+    #[test]
+    fn deleted_directory_containing_active_config_reloads_project() -> anyhow::Result<()> {
+        let system = TestSystem::default();
+        write_file(&system, "/project/pyproject.toml", "")?;
+
+        let mut db = project_db(system);
+
+        let result = db.apply_changes(&[deleted_directory("/project")], None);
+
+        assert!(result.project_changed());
+
+        Ok(())
+    }
+
+    #[test]
+    fn ignore_file_change_reloads_files_not_project_metadata() -> anyhow::Result<()> {
+        let system = TestSystem::default();
+        write_file(&system, "/project/bar.py", "")?;
+        write_file(&system, "/project/.ignore", "")?;
+        write_file(&system, "/project/.gitignore", "")?;
+
+        let mut db = project_db(system.clone());
+
+        let bar = system_path_to_file(&db, SystemPath::new("/project/bar.py"))?;
+
+        assert!(db.project().files(&db).contains(&bar));
+
+        write_file(&system, "/project/foo.py", "")?;
+        let foo = system_path_to_file(&db, SystemPath::new("/project/foo.py"))?;
+
+        write_file(&system, "/project/.ignore", "# reload files")?;
+        write_file(&system, "/project/.gitignore", "# reload files")?;
+
+        let result = db.apply_changes(
+            &[changed("/project/.ignore"), changed("/project/.gitignore")],
+            None,
+        );
+
+        assert!(!result.project_changed());
+
+        let files = db.project().files(&db);
+        assert!(files.contains(&bar));
+        assert!(files.contains(&foo));
 
         Ok(())
     }
