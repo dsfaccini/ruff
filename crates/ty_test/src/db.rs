@@ -1,4 +1,4 @@
-use crate::config::Analysis;
+use crate::config::{Analysis, Rules};
 use camino::{Utf8Component, Utf8PathBuf};
 use ruff_db::Db as SourceDb;
 use ruff_db::diagnostic::{Diagnostic, Severity};
@@ -28,14 +28,11 @@ pub(crate) struct Db {
     files: Files,
     system: MdtestSystem,
     vendored: VendoredFileSystem,
-    rule_selection: Arc<RuleSelection>,
     settings: Option<Settings>,
 }
 
 impl Db {
     pub(crate) fn setup() -> Self {
-        let rule_selection = RuleSelection::all(default_lint_registry(), Severity::Info);
-
         let mut db = Self {
             system: MdtestSystem::in_memory(),
             storage: salsa::Storage::new(Some(Box::new({
@@ -45,11 +42,12 @@ impl Db {
             }))),
             vendored: ty_vendored::file_system().clone(),
             files: Files::default(),
-            rule_selection: Arc::new(rule_selection),
             settings: None,
         };
 
-        db.settings = Some(Settings::new(&db));
+        let settings = Settings::new(&db);
+        db.settings = Some(settings);
+        db.update_rule_selection(None);
         db
     }
 
@@ -114,6 +112,15 @@ impl Db {
         }
     }
 
+    pub(crate) fn update_rule_selection(&mut self, rules: Option<&Rules>) {
+        let rule_selection = mdtest_rule_selection(rules);
+
+        let settings = self.settings();
+        if settings.rule_selection(self) != &rule_selection {
+            settings.set_rule_selection(self).to(rule_selection);
+        }
+    }
+
     pub(crate) fn use_os_system_with_temp_dir(&mut self, cwd: SystemPathBuf, temp_dir: TempDir) {
         self.system.with_os(cwd, temp_dir);
         Files::sync_all(self);
@@ -173,7 +180,7 @@ impl SemanticDb for Db {
     }
 
     fn rule_selection(&self, _file: File) -> &RuleSelection {
-        &self.rule_selection
+        self.settings().rule_selection(self)
     }
 
     fn lint_registry(&self) -> &LintRegistry {
@@ -209,7 +216,50 @@ struct Settings {
     #[returns(ref)]
     analysis: AnalysisSettings,
     #[default]
+    #[returns(ref)]
+    rule_selection: RuleSelection,
+    #[default]
     verbose: bool,
+}
+
+fn mdtest_rule_selection(rules: Option<&Rules>) -> RuleSelection {
+    let registry = default_lint_registry();
+    let mut selection = RuleSelection::all(registry, Severity::Info);
+
+    if let Some(rules) = rules {
+        let set_lint_level =
+            |selection: &mut RuleSelection, lint, level| match Severity::try_from(level) {
+                Ok(severity) => {
+                    selection.enable(lint, severity, ty_python_semantic::lint::LintSource::File);
+                }
+                Err(()) => selection.disable(lint),
+            };
+
+        if let Some(level) = rules.get("all") {
+            for lint in registry.lints() {
+                set_lint_level(&mut selection, *lint, *level);
+            }
+        }
+
+        for (rule_name, level) in rules {
+            if rule_name == "all" {
+                continue;
+            }
+
+            let lint = registry
+                .get(rule_name)
+                .unwrap_or_else(|error| panic!("Unknown lint rule `{rule_name}`: {error}"));
+            set_lint_level(&mut selection, lint, *level);
+        }
+    }
+
+    let explicitly_configures_missing_override = rules
+        .is_some_and(|rules| rules.contains_key("all") || rules.contains_key("missing-override"));
+    if !explicitly_configures_missing_override && let Ok(lint) = registry.get("missing-override") {
+        selection.disable(lint);
+    }
+
+    selection
 }
 
 #[derive(Debug, Clone)]
