@@ -185,6 +185,160 @@ class Foo:
     def bar(self): ...  # error: [invalid-explicit-override]
 ```
 
+## Missing `@override`
+
+```toml
+[rules]
+all = "ignore"
+missing-override = "error"
+```
+
+```py
+from typing_extensions import Any, overload, override
+
+class Parent:
+    attr = None
+
+    def method(self) -> int:
+        return 1
+
+    @property
+    def prop(self) -> int:
+        return 1
+
+    @classmethod
+    def class_method(cls) -> int:
+        return 1
+
+    @staticmethod
+    def static_method() -> int:
+        return 1
+
+    @overload
+    def overloaded(self, value: int) -> int: ...
+    @overload
+    def overloaded(self, value: str) -> str: ...
+    def overloaded(self, value: int | str) -> int | str:
+        return value
+
+class Child(Parent):
+    def method(self) -> int:  # error: [missing-override]
+        return 2
+
+    @property
+    def prop(self) -> int:  # error: [missing-override]
+        return 2
+
+    @classmethod
+    def class_method(cls) -> int:  # error: [missing-override]
+        return 2
+
+    @staticmethod
+    def static_method() -> int:  # error: [missing-override]
+        return 2
+
+class AttributeChild(Parent):
+    def attr(self) -> None:  # error: [missing-override]
+        pass
+
+class OverloadChild(Parent):
+    @overload
+    def overloaded(self, value: int) -> int: ...
+    @overload
+    def overloaded(self, value: str) -> str: ...
+    def overloaded(self, value: int | str) -> int | str:  # error: [missing-override]
+        return value
+
+class ExplicitChild(Parent):
+    @override
+    def method(self) -> int:
+        return 2
+
+    @property
+    @override
+    def prop(self) -> int:
+        return 2
+
+    @override
+    def attr(self) -> None:
+        pass
+
+    @overload
+    def overloaded(self, value: int) -> int: ...
+    @overload
+    def overloaded(self, value: str) -> str: ...
+    @override
+    def overloaded(self, value: int | str) -> int | str:
+        return value
+
+class OverrideOnOverload(Parent):
+    @overload
+    @override
+    def overloaded(self, value: int) -> int: ...
+    @overload
+    def overloaded(self, value: str) -> str: ...
+    def overloaded(self, value: int | str) -> int | str:  # error: [missing-override]
+        return value
+
+class OverrideOnImplementation(Parent):
+    @overload
+    def overloaded(self, value: int) -> int: ...
+    @overload
+    def overloaded(self, value: str) -> str: ...
+    @override
+    def overloaded(self, value: int | str) -> int | str:
+        return value
+
+class Repr:
+    def __repr__(self) -> str:  # error: [missing-override]
+        return "Repr"
+
+class DynamicParent(Any): ...
+
+class DynamicChild(DynamicParent):
+    def method(self) -> int:
+        return 1
+```
+
+`stub.pyi`:
+
+```pyi
+from typing_extensions import overload, override
+
+class StubParent:
+    @overload
+    def method(self, value: int) -> int: ...
+    @overload
+    def method(self, value: str) -> str: ...
+
+class StubChild(StubParent):
+    @overload
+    def method(self, value: int) -> int: ...  # error: [missing-override]
+    @overload
+    def method(self, value: str) -> str: ...
+
+class ExplicitStubChild(StubParent):
+    @overload
+    @override
+    def method(self, value: int) -> int: ...
+    @overload
+    def method(self, value: str) -> str: ...
+
+class OverrideOnSecondOverload(StubParent):
+    @overload
+    def method(self, value: int) -> int: ...  # error: [missing-override]
+    @overload
+    @override
+    def method(self, value: str) -> str: ...
+
+class OverrideOnFirstOverload(StubParent):
+    @overload
+    @override
+    def method(self, value: int) -> int: ...
+    @overload
+    def method(self, value: str) -> str: ...
+```
+
 ## Possibly-unbound definitions
 
 ```py
