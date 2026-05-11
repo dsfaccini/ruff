@@ -23,12 +23,12 @@ use crate::{
         diagnostic::{
             INVALID_ASSIGNMENT, INVALID_ATTRIBUTE_OVERRIDE, INVALID_DATACLASS,
             INVALID_EXPLICIT_OVERRIDE, INVALID_METHOD_OVERRIDE, INVALID_NAMED_TUPLE,
-            INVALID_NAMED_TUPLE_OVERRIDE, OVERRIDE_OF_FINAL_METHOD, OVERRIDE_OF_FINAL_VARIABLE,
-            report_invalid_method_override, report_overridden_final_method,
-            report_overridden_final_variable,
+            INVALID_NAMED_TUPLE_OVERRIDE, MISSING_OVERRIDE, OVERRIDE_OF_FINAL_METHOD,
+            OVERRIDE_OF_FINAL_VARIABLE, report_invalid_method_override,
+            report_overridden_final_method, report_overridden_final_variable,
         },
         enums::{EnumMetadata, enum_metadata},
-        function::{FunctionDecorators, FunctionType, KnownFunction},
+        function::{FunctionDecorators, FunctionType, KnownFunction, OverloadLiteral},
         list_members::{Member, MemberWithDefinition, all_end_of_scope_members},
         tuple::Tuple,
     },
@@ -288,6 +288,7 @@ fn check_class_declaration<'db>(
     let mut has_dynamic_superclass = false;
     let mut has_typeddict_in_mro = false;
     let mut liskov_diagnostic_emitted = false;
+    let mut overridden_superclass_member: Option<(ClassType<'db>, Option<Definition<'db>>)> = None;
     let mut overridden_final_method = None;
     let mut overridden_final_variable: Option<(ClassType<'db>, Option<Definition<'db>>)> = None;
     let is_private_member = is_mangled_private(member.name.as_str());
@@ -363,6 +364,12 @@ fn check_class_declaration<'db>(
             };
 
             subclass_overrides_superclass_declaration = true;
+
+            if configuration.check_missing_overrides() && overridden_superclass_member.is_none() {
+                let superclass_definition =
+                    superclass_symbol_id.and_then(|id| symbol_definition(db, superclass_scope, id));
+                overridden_superclass_member = Some((superclass, superclass_definition));
+            }
 
             // Record the first superclass that defines this method as the "immediate parent method"
             if immediate_parent_method.is_none() {
@@ -588,6 +595,15 @@ fn check_class_declaration<'db>(
                 subclass_overrides_superclass_declaration = true;
             }
         }
+    }
+
+    if let Some((superclass, superclass_definition)) = overridden_superclass_member
+        && configuration.check_missing_overrides()
+        // accessing `.kind()` here is fine as `definition`
+        // will always be a definition in the file currently being checked
+        && first_reachable_definition.kind(db).is_function_def()
+    {
+        check_missing_overrides(context, member, superclass, superclass_definition);
     }
 
     if !subclass_overrides_superclass_declaration
@@ -924,6 +940,7 @@ bitflags! {
         const INVALID_DATACLASS = 1 << 6;
         const FINAL_VARIABLE_OVERRIDDEN = 1 << 7;
         const INVALID_ENUM_VALUE = 1 << 8;
+        const MISSING_OVERRIDE = 1 << 9;
     }
 }
 
@@ -942,6 +959,9 @@ impl From<&InferContext<'_, '_>> for OverrideRulesConfig {
         }
         if rule_selection.is_enabled(LintId::of(&INVALID_EXPLICIT_OVERRIDE)) {
             config |= OverrideRulesConfig::EXPLICIT_OVERRIDE;
+        }
+        if rule_selection.is_enabled(LintId::of(&MISSING_OVERRIDE)) {
+            config |= OverrideRulesConfig::MISSING_OVERRIDE;
         }
         if rule_selection.is_enabled(LintId::of(&OVERRIDE_OF_FINAL_METHOD)) {
             config |= OverrideRulesConfig::FINAL_METHOD_OVERRIDDEN;
@@ -986,6 +1006,10 @@ impl OverrideRulesConfig {
 
     const fn check_final_method_overridden(self) -> bool {
         self.contains(OverrideRulesConfig::FINAL_METHOD_OVERRIDDEN)
+    }
+
+    const fn check_missing_overrides(self) -> bool {
+        self.contains(OverrideRulesConfig::MISSING_OVERRIDE)
     }
 
     const fn check_invalid_named_tuple_definitions(self) -> bool {
@@ -1047,6 +1071,74 @@ fn check_explicit_overrides<'db>(
         member = &member.name,
         class = class.name(db)
     ));
+}
+
+fn check_missing_overrides<'db>(
+    context: &InferContext<'db, '_>,
+    member: &Member<'db>,
+    superclass: ClassType<'db>,
+    superclass_definition: Option<Definition<'db>>,
+) {
+    let db = context.db();
+
+    let Some(missing_override_definition) =
+        missing_override_decorator_definition(db, member.ty, context.in_stub())
+    else {
+        return;
+    };
+
+    let Some(builder) = context.report_lint(
+        &MISSING_OVERRIDE,
+        missing_override_definition.focus_range(db, context.module()),
+    ) else {
+        return;
+    };
+
+    let superclass_name = superclass.name(db);
+    let superclass_member = format!("{superclass_name}.{}", member.name);
+    let mut diagnostic = builder.into_diagnostic(format_args!(
+        "Method `{}` overrides `{superclass_member}` but is not decorated with `@override`",
+        member.name
+    ));
+    diagnostic.info("Decorate the method with `@typing.override` to make the override explicit");
+
+    if let Some(superclass_definition) = superclass_definition
+        && superclass_definition.file(db) == context.file()
+    {
+        diagnostic.annotate(
+            Annotation::secondary(
+                context.span(superclass_definition.focus_range(db, context.module())),
+            )
+            .message(format_args!("`{superclass_member}` defined here")),
+        );
+    }
+}
+
+fn missing_override_decorator_definition<'db>(
+    db: &'db dyn Db,
+    ty: Type<'db>,
+    in_stub: bool,
+) -> Option<OverloadLiteral<'db>> {
+    extract_underlying_functions(db, ty)?
+        .into_iter()
+        .find_map(|function| {
+            let definition = override_decorator_definition(db, function, in_stub);
+            (!definition.has_known_decorator(db, FunctionDecorators::OVERRIDE))
+                .then_some(definition)
+        })
+}
+
+fn override_decorator_definition<'db>(
+    db: &'db dyn Db,
+    function: FunctionType<'db>,
+    in_stub: bool,
+) -> OverloadLiteral<'db> {
+    let (_, implementation) = function.overloads_and_implementation(db);
+    if !in_stub && let Some(implementation) = implementation {
+        implementation
+    } else {
+        function.first_overload_or_implementation(db)
+    }
 }
 
 fn extract_underlying_functions<'db>(
