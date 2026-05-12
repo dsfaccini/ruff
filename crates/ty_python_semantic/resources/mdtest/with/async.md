@@ -265,6 +265,34 @@ async def main_async_generator():
         reveal_type(session)  # revealed: Session
 ```
 
+Generic parameters are preserved on the decorated callable:
+
+```py
+from functools import partial
+from typing import Generic, TypeVar
+
+T = TypeVar("T")
+U = TypeVar("U")
+
+class Agent(Generic[T, U]): ...
+
+class Worker(Generic[U, T]):
+    def __init__(self, agent: Agent[T, U]) -> None:
+        self.agent = agent
+
+@asynccontextmanager
+async def worker_lifespan(
+    app: object, *, worker: Worker[U, T], agent: Agent[T, U]
+) -> AsyncIterator[None]:
+    yield
+
+def agent_to_a2a(agent: Agent[T, U]) -> object:
+    worker = Worker(agent)
+    reveal_type(worker_lifespan(object(), worker=worker, agent=agent))  # revealed: _AsyncGeneratorContextManager[None, None]
+    reveal_type(partial(worker_lifespan, worker=worker, agent=agent))  # revealed: partial[(app: object, *, worker: Worker[U@agent_to_a2a, T@agent_to_a2a] = ..., agent: Agent[T@agent_to_a2a, U@agent_to_a2a] = ...) -> _AsyncGeneratorContextManager[None, None]]
+    return partial(worker_lifespan, worker=worker, agent=agent)
+```
+
 ## `asyncio.timeout`
 
 ```toml

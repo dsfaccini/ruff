@@ -7036,7 +7036,11 @@ fn asynccontextmanager_return_type<'db>(db: &'db dyn Db, func_ty: Type<'db>) -> 
     });
 
     let new_return_ty = Type::from(context_manager).to_instance(db)?;
-    let new_signature = Signature::new(signature.parameters().clone(), new_return_ty);
+    let new_signature = Signature::new_generic(
+        signature.generic_context,
+        signature.parameters().clone(),
+        new_return_ty,
+    );
 
     Some(Type::Callable(CallableType::new(
         db,
