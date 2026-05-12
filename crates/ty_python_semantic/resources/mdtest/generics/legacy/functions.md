@@ -63,6 +63,41 @@ reveal_type(f(True))  # revealed: Literal[True]
 reveal_type(f("string"))  # revealed: Literal["string"]
 ```
 
+Parameter defaults can specialize generic parameters, the same as call arguments:
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+```py
+from types import NoneType
+from typing import TypeVar
+
+T = TypeVar("T", default=None)
+U = TypeVar("U")
+V = TypeVar("V")
+
+def with_default(x: T = None) -> T:
+    return x
+
+def without_typevar_default(x: U = None) -> U:
+    return x
+
+def type_default(x: type[V] = NoneType) -> type[V]:
+    return x
+
+def concrete_default(x: int = None) -> int:  # error: [invalid-parameter-default]
+    return x
+
+reveal_type(with_default())  # revealed: None
+reveal_type(with_default(1))  # revealed: Literal[1]
+reveal_type(without_typevar_default())  # revealed: None
+reveal_type(without_typevar_default(1))  # revealed: Literal[1]
+reveal_type(type_default())  # revealed: <class 'NoneType'>
+reveal_type(type_default(int))  # revealed: type[int]
+```
+
 ## Inferring “deep” generic parameter types
 
 The matching up of call arguments and discovery of constraints on typevars can be a recursive

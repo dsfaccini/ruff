@@ -4802,12 +4802,14 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
         let mut assignable_to_declared_type = true;
 
         let parameters = self.signature.parameters();
+        let mut matched_parameters = FxHashSet::default();
         for (argument_index, adjusted_argument_index, _, argument_types) in
             self.enumerate_argument_types()
         {
             for (parameter_index, variadic_argument_type) in
                 self.argument_matches[argument_index].iter()
             {
+                matched_parameters.insert(parameter_index);
                 if self.is_gradual_variadic_parameter(parameter_index) {
                     continue;
                 }
@@ -4843,6 +4845,44 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                         argument_index: adjusted_argument_index,
                     });
                 }
+            }
+        }
+
+        for (parameter_index, parameter) in parameters.iter().enumerate() {
+            if matched_parameters.contains(&parameter_index)
+                || self.is_gradual_variadic_parameter(parameter_index)
+            {
+                continue;
+            }
+            let Some(default_type) = parameter.default_type() else {
+                continue;
+            };
+
+            let declared_type = parameter.annotated_type();
+            let specialization_result =
+                builder.infer_map(declared_type, default_type, |(identity, _, inferred_ty)| {
+                    // Avoid widening the inferred type if it is already assignable to the
+                    // preferred declared type.
+                    if let Some(preferred_ty) = preferred_type_mappings.get(&identity) {
+                        if inferred_ty.is_assignable_to(self.db, *preferred_ty) {
+                            return None;
+                        }
+
+                        // If this is a partially specialized type, the type we infer may still
+                        // be assignable to it once fully specialized.
+                        if !partially_specialized_declared_type.contains(&identity) {
+                            assignable_to_declared_type = false;
+                        }
+                    }
+
+                    Some(inferred_ty)
+                });
+
+            if let Err(error) = specialization_result {
+                specialization_errors.push(BindingError::SpecializationError {
+                    error,
+                    argument_index: None,
+                });
             }
         }
 

@@ -4,6 +4,7 @@ use crate::{
     types::{
         KnownClass, KnownInstanceType, ParamSpecAttrKind, SubclassOfInner, SubclassOfType, Type,
         TypeContext, UnionType,
+        constraints::ConstraintSetBuilder,
         diagnostic::{
             FINAL_ON_NON_METHOD, INVALID_PARAMETER_DEFAULT, INVALID_PARAMSPEC, INVALID_TYPE_FORM,
             USELESS_OVERLOAD_BODY, add_type_expression_reference_link,
@@ -51,6 +52,18 @@ fn parameters_have_annotations(parameters: &ast::Parameters) -> bool {
             .kwarg
             .as_deref()
             .is_some_and(|param| param.annotation.is_some())
+}
+
+fn is_valid_parameter_default<'db>(
+    db: &'db dyn Db,
+    default_ty: Type<'db>,
+    declared_ty: Type<'db>,
+) -> bool {
+    let constraints = ConstraintSetBuilder::new();
+    default_ty.is_assignable_to(db, declared_ty)
+        || !default_ty
+            .when_constraint_set_assignable_to(db, declared_ty, &constraints)
+            .is_never_satisfied(db)
 }
 
 /// Return type policy for checking explicit `return` statements in a function body.
@@ -818,7 +831,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 // Avoid duplicate diagnostics: invalid TypedDict literals already emit specific errors.
                 let suppress_invalid_default =
                     is_invalid_typed_dict_literal(db, declared_ty, default_expr.into());
-                if !default_ty.is_assignable_to(db, declared_ty)
+                if !is_valid_parameter_default(db, default_ty, declared_ty)
                     && !suppress_invalid_default
                     && !((self.in_stub()
                         || self.in_function_overload_or_abstractmethod()
