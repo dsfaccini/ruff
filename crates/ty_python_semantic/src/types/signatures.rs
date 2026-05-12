@@ -454,6 +454,7 @@ impl<'db> CallableSignature<'db> {
         db: &'db dyn Db,
         other: &Self,
         constraints: &'c ConstraintSetBuilder<'db>,
+        inferable: InferableTypeVars<'db>,
     ) -> ConstraintSet<'db, 'c> {
         let relation_visitor = HasRelationToVisitor::default(constraints);
         let disjointness_visitor = IsDisjointVisitor::default(constraints);
@@ -466,7 +467,9 @@ impl<'db> CallableSignature<'db> {
             &signature_relation_visitor,
             &materialization_visitor,
         );
-        checker.check_callable_signature_pair_inner(db, &self.overloads, &other.overloads)
+        checker
+            .with_inferable_typevars(inferable)
+            .check_callable_signature_pair_inner(db, &self.overloads, &other.overloads)
     }
 }
 
@@ -1206,11 +1209,25 @@ impl<'db> Signature<'db> {
         db: &'db dyn Db,
         other: &CallableSignature<'db>,
         constraints: &'c ConstraintSetBuilder<'db>,
+        inferable: InferableTypeVars<'db>,
     ) -> ConstraintSet<'db, 'c> {
         // If this signature is a paramspec, bind it to the entire overloaded other callable.
         if let Some(self_bound_typevar) = self.parameters.as_paramspec()
             && other.is_single_paramspec().is_none()
         {
+            let relation_visitor = HasRelationToVisitor::default(constraints);
+            let disjointness_visitor = IsDisjointVisitor::default(constraints);
+            let signature_relation_visitor = SignatureRelationVisitor::default();
+            let materialization_visitor = ApplyTypeMappingVisitor::default();
+            let checker = TypeRelationChecker::constraint_set_assignability(
+                constraints,
+                &relation_visitor,
+                &disjointness_visitor,
+                &signature_relation_visitor,
+                &materialization_visitor,
+            )
+            .with_inferable_typevars(inferable);
+
             let upper = Type::Callable(CallableType::new(
                 db,
                 CallableSignature::from_overloads(other.overloads.iter().map(|signature| {
@@ -1234,11 +1251,7 @@ impl<'db> Signature<'db> {
                 .iter()
                 .map(|signature| signature.return_ty)
                 .when_any(db, constraints, |other_return_type| {
-                    self.return_ty.when_constraint_set_assignable_to(
-                        db,
-                        other_return_type,
-                        constraints,
-                    )
+                    checker.check_type_pair(db, self.return_ty, other_return_type)
                 });
             return param_spec_matches.and(db, constraints, || return_types_match);
         }
@@ -1247,7 +1260,7 @@ impl<'db> Signature<'db> {
             .overloads
             .iter()
             .when_all(db, constraints, |other_signature| {
-                self.when_constraint_set_assignable_to(db, other_signature, constraints)
+                self.when_constraint_set_assignable_to(db, other_signature, constraints, inferable)
             })
     }
 
@@ -1256,6 +1269,7 @@ impl<'db> Signature<'db> {
         db: &'db dyn Db,
         other: &Self,
         constraints: &'c ConstraintSetBuilder<'db>,
+        inferable: InferableTypeVars<'db>,
     ) -> ConstraintSet<'db, 'c> {
         let relation_visitor = HasRelationToVisitor::default(constraints);
         let disjointness_visitor = IsDisjointVisitor::default(constraints);
@@ -1268,7 +1282,9 @@ impl<'db> Signature<'db> {
             &signature_relation_visitor,
             &materialization_visitor,
         );
-        checker.check_signature_pair(db, self, other)
+        checker
+            .with_inferable_typevars(inferable)
+            .check_signature_pair(db, self, other)
     }
 
     /// Create a new signature with the given definition.

@@ -177,6 +177,30 @@ class Foo:
         return "a"
 
 reveal_type(Foo().foo)  # revealed: str
+
+from typing import Callable, Generic, Optional, ParamSpec, TypeVar
+
+T = TypeVar("T")
+P = ParamSpec("P")
+R = TypeVar("R")
+
+def deco(func: Callable[P, R]) -> Callable[P, R]:
+    return func
+
+class Container(Generic[T]):
+    @cached_property
+    def value(self) -> Optional[list[T]]:
+        return None
+
+reveal_type(Container[int]().value)  # revealed: None | list[int]
+
+class DecoratedContainer(Generic[T]):
+    @cached_property
+    @deco
+    def value(self) -> Optional[list[T]]:
+        return None
+
+reveal_type(DecoratedContainer[int]().value)  # revealed: None | list[int]
 ```
 
 ## Lambdas as decorators

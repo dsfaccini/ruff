@@ -18,7 +18,7 @@ use crate::types::relation::{
     DisjointnessChecker, HasRelationToVisitor, IsDisjointVisitor, TypeRelation, TypeRelationChecker,
 };
 use crate::types::signatures::{
-    CallableSignature, Parameters, ReturnCallableTypeVarScope, SignatureRelationVisitor,
+    CallableSignature, Parameters, ReturnCallableTypeVarScope, Signature, SignatureRelationVisitor,
 };
 use crate::types::tuple::{TupleSpec, TupleType, walk_tuple_type};
 use crate::types::type_alias::{walk_manual_pep_695_type_alias, walk_pep_695_type_alias};
@@ -1874,6 +1874,24 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
         }
     }
 
+    fn extend_type_mappings(
+        &mut self,
+        types: impl IntoIterator<Item = (BoundTypeVarIdentity<'db>, UnionAccumulator<'db>)>,
+    ) {
+        for (identity, mut accumulator) in types {
+            match self.types.entry(identity) {
+                Entry::Occupied(mut entry) => {
+                    entry
+                        .get_mut()
+                        .add(self.db, accumulator.get_or_build(self.db));
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(accumulator);
+                }
+            }
+        }
+    }
+
     fn add_type_mapping(
         &mut self,
         bound_typevar: BoundTypeVarInstance<'db>,
@@ -2036,6 +2054,73 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
         self.add_type_mappings_from_constraint_set(formal, set, f)
     }
 
+    fn should_infer_from_callable_return(&self, actual_signature: &Signature<'db>) -> bool {
+        let Some(generic_context) = actual_signature.generic_context else {
+            return true;
+        };
+
+        struct UsesGenericContextTypeVar<'db> {
+            generic_context: GenericContext<'db>,
+            uses_typevar: Cell<bool>,
+            recursion_guard: TypeCollector<'db>,
+        }
+
+        impl<'db> TypeVisitor<'db> for UsesGenericContextTypeVar<'db> {
+            fn should_visit_lazy_type_attributes(&self) -> bool {
+                false
+            }
+
+            fn visit_type(&self, db: &'db dyn Db, ty: Type<'db>) {
+                walk_type_with_recursion_guard(db, ty, self, &self.recursion_guard);
+            }
+
+            fn visit_bound_type_var_type(
+                &self,
+                db: &'db dyn Db,
+                bound_typevar: BoundTypeVarInstance<'db>,
+            ) {
+                if self
+                    .generic_context
+                    .binds_typevar(db, bound_typevar.typevar(db))
+                    .is_some()
+                {
+                    self.uses_typevar.set(true);
+                }
+            }
+        }
+
+        let visitor = UsesGenericContextTypeVar {
+            generic_context,
+            uses_typevar: Cell::new(false),
+            recursion_guard: TypeCollector::default(),
+        };
+        visitor.visit_type(self.db, actual_signature.return_ty);
+        !visitor.uses_typevar.get()
+    }
+
+    fn add_type_mappings_from_callable_returns(
+        &mut self,
+        formal_signature: &CallableSignature<'db>,
+        actual_signature: &Signature<'db>,
+        f: &mut dyn FnMut(TypeVarAssignment<'db>) -> Option<Type<'db>>,
+    ) -> Result<(), ()> {
+        let mut return_builder =
+            SpecializationBuilder::new(self.db, self.constraints, self.inferable);
+        for formal_overload in &formal_signature.overloads {
+            return_builder
+                .infer_map_impl(
+                    formal_overload.return_ty,
+                    actual_signature.return_ty,
+                    TypeVarVariance::Covariant,
+                    &mut *f,
+                    &mut FxHashSet::default(),
+                )
+                .map_err(|_| ())?;
+        }
+        self.extend_type_mappings(return_builder.types);
+        Ok(())
+    }
+
     /// Infer type mappings by comparing formal callable signatures against actual callables.
     fn infer_from_callable_signature(
         &mut self,
@@ -2050,7 +2135,12 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
             if formal_is_single_paramspec {
                 let when = actual_callable
                     .signatures(self.db)
-                    .when_constraint_set_assignable_to(self.db, formal_signature, self.constraints);
+                    .when_constraint_set_assignable_to(
+                        self.db,
+                        formal_signature,
+                        self.constraints,
+                        self.inferable,
+                    );
                 self.add_type_mappings_from_constraint_set(formal, when, &mut *f)?;
             } else {
                 // An overloaded actual callable is compatible with the formal signature if at
@@ -2062,11 +2152,19 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                         self.db,
                         formal_signature,
                         self.constraints,
+                        self.inferable,
                     );
                     if self
                         .add_type_mappings_from_constraint_set(formal, when, &mut *f)
                         .is_ok()
                     {
+                        if self.should_infer_from_callable_return(actual_signature) {
+                            self.add_type_mappings_from_callable_returns(
+                                formal_signature,
+                                actual_signature,
+                                &mut *f,
+                            )?;
+                        }
                         any_satisfiable = true;
                     }
                 }
