@@ -7009,16 +7009,55 @@ const MAXIMUM_OVERLOADS: usize = 50;
 ///
 /// TODO: This function only handles the most basic case. It should be removed once we have
 /// full support for generic protocols in the solver.
-fn asynccontextmanager_return_type<'db>(db: &'db dyn Db, func_ty: Type<'db>) -> Option<Type<'db>> {
-    let bindings = func_ty.bindings(db);
-    let binding = bindings
-        .single_element()?
-        .overloads
-        .iter()
-        .exactly_one()
-        .ok()?;
-    let signature = &binding.signature;
+pub(crate) fn asynccontextmanager_return_type<'db>(
+    db: &'db dyn Db,
+    func_ty: Type<'db>,
+) -> Option<Type<'db>> {
+    let signature = match func_ty {
+        Type::FunctionLiteral(function) => {
+            let (overloads, implementation) = function.overloads_and_implementation(db);
+            let implementation_signature = implementation
+                .map(|implementation| implementation.signature(db))
+                .unwrap_or_else(|| function.last_definition_signature(db).clone());
+            asynccontextmanager_signature(db, &implementation_signature)?;
 
+            if !overloads.is_empty() {
+                return Some(Type::Callable(CallableType::new(
+                    db,
+                    CallableSignature::from_overloads(
+                        overloads.iter().map(|overload| overload.signature(db)),
+                    ),
+                    CallableTypeKind::FunctionLike,
+                )));
+            }
+
+            implementation_signature
+        }
+        _ => {
+            let bindings = func_ty.bindings(db);
+            let binding = bindings
+                .single_element()?
+                .overloads
+                .iter()
+                .exactly_one()
+                .ok()?;
+            binding.signature.clone()
+        }
+    };
+
+    asynccontextmanager_signature(db, &signature).map(|signature| {
+        Type::Callable(CallableType::new(
+            db,
+            CallableSignature::single(signature),
+            CallableTypeKind::FunctionLike,
+        ))
+    })
+}
+
+fn asynccontextmanager_signature<'db>(
+    db: &'db dyn Db,
+    signature: &Signature<'db>,
+) -> Option<Signature<'db>> {
     let yield_ty = signature
         .return_ty
         .try_iterate_with_mode(db, EvaluationMode::Async)
@@ -7042,11 +7081,7 @@ fn asynccontextmanager_return_type<'db>(db: &'db dyn Db, func_ty: Type<'db>) -> 
         new_return_ty,
     );
 
-    Some(Type::Callable(CallableType::new(
-        db,
-        CallableSignature::single(new_signature),
-        CallableTypeKind::FunctionLike,
-    )))
+    Some(new_signature)
 }
 
 /// Maximum repetition count for struct format specifiers.

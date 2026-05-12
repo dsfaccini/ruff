@@ -38,7 +38,7 @@ use crate::place::{
 };
 use crate::reachability::ReachabilityConstraintsExtension;
 use crate::types::add_inferred_python_version_hint_to_diagnostic;
-use crate::types::call::bind::MatchingOverloadIndex;
+use crate::types::call::bind::{MatchingOverloadIndex, asynccontextmanager_return_type};
 use crate::types::call::{Binding, Bindings, CallArguments, CallError, CallErrorKind};
 use crate::types::callable::CallableTypeKind;
 use crate::types::class::{ClassLiteral, CodeGeneratorKind, MethodDecorator};
@@ -4938,6 +4938,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         };
 
         let call_arguments = CallArguments::positional([decorated_ty]);
+        if let Type::FunctionLiteral(decorator) = decorator_ty
+            && decorator.is_known(self.db(), KnownFunction::AsyncContextManager)
+            && let Some(return_ty) = asynccontextmanager_return_type(self.db(), decorated_ty)
+        {
+            return return_ty;
+        }
+
         let return_ty = decorator_ty
             .try_call(self.db(), &call_arguments)
             .map(|bindings| bindings.return_type(self.db()))

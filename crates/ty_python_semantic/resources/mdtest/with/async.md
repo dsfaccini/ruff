@@ -248,6 +248,27 @@ async def main_iterator():
         reveal_type(session)  # revealed: Session
 ```
 
+Overloaded context managers use overload stubs for their public type while the decorated
+implementation still returns an `AsyncIterator`:
+
+```py
+from contextlib import AbstractAsyncContextManager
+from typing import overload
+
+@overload
+def overloaded_connect(name: str) -> AbstractAsyncContextManager[str]: ...
+
+@overload
+def overloaded_connect(name: None = None) -> AbstractAsyncContextManager[Session]: ...
+
+@asynccontextmanager
+async def overloaded_connect(name: str | None = None) -> AsyncIterator[str | Session]:
+    yield name if name is not None else Session()
+
+reveal_type(overloaded_connect("prod"))  # revealed: AbstractAsyncContextManager[str, bool | None]
+reveal_type(overloaded_connect())  # revealed: AbstractAsyncContextManager[Session, bool | None]
+```
+
 And with `AsyncGeneratorType` return types:
 
 ```py
