@@ -393,6 +393,16 @@ impl<'db> StaticClassLiteral<'db> {
         })
     }
 
+    pub(crate) fn runtime_check_top_materialization(self, db: &'db dyn Db) -> ClassType<'db> {
+        self.apply_specialization(db, |generic_context| {
+            generic_context.unknown_specialization(db).materialize_impl(
+                db,
+                MaterializationKind::Top,
+                &ApplyTypeMappingVisitor::default(),
+            )
+        })
+    }
+
     /// Returns the default specialization of this class. For non-generic classes, the class is
     /// returned unchanged. For a non-specialized generic class, we return a generic alias that
     /// applies the default specialization to the class's typevars.

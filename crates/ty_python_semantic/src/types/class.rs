@@ -746,6 +746,21 @@ impl<'db> ClassLiteral<'db> {
         }
     }
 
+    /// Returns the top materialization used for runtime class checks.
+    ///
+    /// Type parameter defaults do not affect `isinstance(x, C)` or `issubclass(x, C)`: the runtime
+    /// check is against the class object itself. Generic parameters are therefore specialized to
+    /// `Unknown` before materialization, rather than to their defaults.
+    pub(crate) fn runtime_check_top_materialization(self, db: &'db dyn Db) -> ClassType<'db> {
+        match self {
+            Self::Static(class) => class.runtime_check_top_materialization(db),
+            Self::Dynamic(_)
+            | Self::DynamicNamedTuple(_)
+            | Self::DynamicTypedDict(_)
+            | Self::DynamicEnum(_) => ClassType::NonGeneric(self),
+        }
+    }
+
     /// Returns the `TypedDict` member lookup.
     pub(crate) fn typed_dict_member(
         self,

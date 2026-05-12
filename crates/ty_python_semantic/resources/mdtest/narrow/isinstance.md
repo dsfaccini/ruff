@@ -787,6 +787,25 @@ def _(x: object):
         reveal_type(x.y)  # revealed: tuple[A, object]
 ```
 
+Legacy `TypeVar` defaults are ignored the same way. At runtime, `isinstance(x, LegacyDefault)`
+checks against the class object, not against a specialization chosen from the type parameter
+default.
+
+```py
+from typing import Generic, TypeVar
+
+T = TypeVar("T", default=None)
+
+class LegacyDefault(Generic[T]): ...
+
+def _(x: LegacyDefault[T] | str) -> str:
+    if isinstance(x, LegacyDefault):
+        reveal_type(x)  # revealed: LegacyDefault[T@_]
+        return "legacy"
+    reveal_type(x)  # revealed: str & ~Top[LegacyDefault[Unknown]]
+    return x
+```
+
 ## Narrowing generic `classmethod`
 
 After an `isinstance(..., classmethod)` branch unwraps and replaces a generic `classmethod`, the
