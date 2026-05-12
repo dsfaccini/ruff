@@ -2386,6 +2386,40 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                     return Err(error);
                 }
             }
+            (formal, Type::Union(actual_union)) if !matches!(formal, Type::ProtocolInstance(_)) => {
+                let mut first_error = None;
+                let mut found_matching_element = false;
+                for actual_element in actual_union.elements(self.db) {
+                    if actual_element.is_unknown()
+                        || actual_element
+                            .when_assignable_to(self.db, formal, self.constraints, self.inferable)
+                            .is_never_satisfied(self.db)
+                    {
+                        continue;
+                    }
+
+                    let mut element_builder =
+                        SpecializationBuilder::new(self.db, self.constraints, self.inferable);
+                    let mut element_seen = seen.clone();
+                    let result = element_builder.infer_map_impl(
+                        formal,
+                        *actual_element,
+                        polarity,
+                        &mut f,
+                        &mut element_seen,
+                    );
+                    if let Err(err) = result {
+                        first_error.get_or_insert(err);
+                    } else {
+                        found_matching_element = true;
+                        self.extend_type_mappings(element_builder.types);
+                    }
+                }
+
+                if !found_matching_element && let Some(error) = first_error {
+                    return Err(error);
+                }
+            }
 
             (Type::TypeVar(bound_typevar), ty) | (ty, Type::TypeVar(bound_typevar))
                 if bound_typevar.is_inferable(self.db, self.inferable) =>

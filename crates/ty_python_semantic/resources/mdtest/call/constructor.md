@@ -1128,6 +1128,34 @@ class Box(Generic[T]):
 reveal_type(Box(1))  # revealed: Box[int]
 ```
 
+Constructor inference can still use the informative arm of an actual union when another arm is
+`Unknown`.
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+```py
+from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import Generic, TypeVar
+
+T = TypeVar("T", default=None)
+
+class Base(Generic[T]): ...
+
+@dataclass
+class Derived(Base[T]):
+    xs: Sequence[Base[T]]
+
+def build(x: Sequence[Base[T]] | None) -> Derived[T]:
+    xs = list(x or [])
+    reveal_type(xs)  # revealed: list[Base[T@build] | Unknown]
+    reveal_type(Derived(xs))  # revealed: Derived[T@build]
+    return Derived(xs)
+```
+
 ## Generic constructor inference from overloaded `__init__` self types
 
 ```py
