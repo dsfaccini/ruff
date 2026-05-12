@@ -1888,6 +1888,111 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
         self.insert_type_mapping(bound_typevar, ty);
     }
 
+    fn infer_bare_typevar_mapping(
+        &mut self,
+        bound_typevar: BoundTypeVarInstance<'db>,
+        ty: Type<'db>,
+        polarity: TypeVarVariance,
+        f: &mut dyn FnMut(TypeVarAssignment<'db>) -> Option<Type<'db>>,
+    ) -> Result<(), SpecializationError<'db>> {
+        match bound_typevar.typevar(self.db).bound_or_constraints(self.db) {
+            Some(TypeVarBoundOrConstraints::UpperBound(bound)) => {
+                if polarity.is_contravariant() {
+                    // In a contravariant position, the formal type variable is a subtype of
+                    // the actual type (`T <: ty`). Since we also have the upper bound
+                    // constraint `T <: bound`, we just need to ensure that the intersection
+                    // of `ty` and `bound` is non-empty. Since `Never` is always a valid
+                    // intersection if the types are disjoint, we don't need to perform any
+                    // check here.
+                    self.add_type_mapping(
+                        bound_typevar,
+                        IntersectionType::from_two_elements(self.db, bound, ty),
+                        polarity,
+                        f,
+                    );
+                    return Ok(());
+                }
+                if !ty
+                    .when_assignable_to(self.db, bound, self.constraints, self.inferable)
+                    .is_always_satisfied(self.db)
+                {
+                    return Err(SpecializationError::MismatchedBound {
+                        bound_typevar,
+                        argument: ty,
+                    });
+                }
+                self.add_type_mapping(bound_typevar, ty, polarity, f);
+            }
+            Some(TypeVarBoundOrConstraints::Constraints(typevar_constraints)) => {
+                // Prefer an exact match first.
+                for constraint in typevar_constraints.elements(self.db) {
+                    if ty == *constraint {
+                        self.add_type_mapping(bound_typevar, ty, polarity, f);
+                        return Ok(());
+                    }
+                }
+
+                // If `ty` is itself a constrained TypeVar, check whether each
+                // of its constraints is equivalent to at least one constraint of
+                // the formal TypeVar. This handles the case where two TypeVars
+                // with identical constraint sets are used across function
+                // boundaries.
+                //
+                // We require equivalence rather than assignability to maintain
+                // soundness: constrained TypeVars allow narrowing via
+                // `isinstance` checks inside the function body, so a constraint
+                // that is a strict subtype (e.g. `bool` vs `int`) would allow
+                // the callee to return a widened type that violates the caller's
+                // constraint.
+                if let Type::TypeVar(actual_typevar) = ty
+                    && let Some(actual_constraints) =
+                        actual_typevar.typevar(self.db).constraints(self.db)
+                {
+                    let all_satisfied = actual_constraints.iter().all(|actual_constraint| {
+                        typevar_constraints
+                            .elements(self.db)
+                            .iter()
+                            .any(|formal_constraint| {
+                                actual_constraint.is_equivalent_to(self.db, *formal_constraint)
+                            })
+                    });
+                    if all_satisfied {
+                        self.add_type_mapping(bound_typevar, ty, polarity, f);
+                        return Ok(());
+                    }
+                }
+
+                for constraint in typevar_constraints.elements(self.db) {
+                    let is_satisfied = if polarity.is_contravariant() {
+                        constraint
+                            .when_assignable_to(self.db, ty, self.constraints, self.inferable)
+                            .is_always_satisfied(self.db)
+                    } else {
+                        ty.when_assignable_to(
+                            self.db,
+                            *constraint,
+                            self.constraints,
+                            self.inferable,
+                        )
+                        .is_always_satisfied(self.db)
+                    };
+
+                    if is_satisfied {
+                        self.add_type_mapping(bound_typevar, *constraint, polarity, f);
+                        return Ok(());
+                    }
+                }
+                return Err(SpecializationError::MismatchedConstraint {
+                    bound_typevar,
+                    argument: ty,
+                });
+            }
+            _ => self.add_type_mapping(bound_typevar, ty, polarity, f),
+        }
+
+        Ok(())
+    }
+
     /// Finds all of the valid specializations of a constraint set, and adds their type mappings to
     /// the specialization that this builder is building up.
     ///
@@ -2025,6 +2130,15 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
         // Avoid infinite recursion
         if !seen.insert((formal, actual)) {
             return Ok(());
+        }
+
+        match (formal, actual) {
+            (Type::TypeVar(bound_typevar), ty) | (ty, Type::TypeVar(bound_typevar))
+                if bound_typevar.is_inferable(self.db, self.inferable) =>
+            {
+                return self.infer_bare_typevar_mapping(bound_typevar, ty, polarity, f);
+            }
+            _ => {}
         }
 
         // Remove the union elements from `actual` that are not related to `formal`, and vice
@@ -2178,105 +2292,17 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
             (Type::TypeVar(bound_typevar), ty) | (ty, Type::TypeVar(bound_typevar))
                 if bound_typevar.is_inferable(self.db, self.inferable) =>
             {
-                match bound_typevar.typevar(self.db).bound_or_constraints(self.db) {
-                    Some(TypeVarBoundOrConstraints::UpperBound(bound)) => {
-                        if polarity.is_contravariant() {
-                            // In a contravariant position, the formal type variable is a subtype of
-                            // the actual type (`T <: ty`). Since we also have the upper bound
-                            // constraint `T <: bound`, we just need to ensure that the intersection
-                            // of `ty` and `bound` is non-empty. Since `Never` is always a valid
-                            // intersection if the types are disjoint, we don't need to perform any
-                            // check here.
-                            self.add_type_mapping(
-                                bound_typevar,
-                                IntersectionType::from_two_elements(self.db, bound, ty),
-                                polarity,
-                                f,
-                            );
-                            return Ok(());
-                        }
-                        if !ty
-                            .when_assignable_to(self.db, bound, self.constraints, self.inferable)
-                            .is_always_satisfied(self.db)
-                        {
-                            return Err(SpecializationError::MismatchedBound {
-                                bound_typevar,
-                                argument: ty,
-                            });
-                        }
-                        self.add_type_mapping(bound_typevar, ty, polarity, f);
-                    }
-                    Some(TypeVarBoundOrConstraints::Constraints(typevar_constraints)) => {
-                        // Prefer an exact match first.
-                        for constraint in typevar_constraints.elements(self.db) {
-                            if ty == *constraint {
-                                self.add_type_mapping(bound_typevar, ty, polarity, f);
-                                return Ok(());
-                            }
-                        }
+                return self.infer_bare_typevar_mapping(bound_typevar, ty, polarity, f);
+            }
 
-                        // If `ty` is itself a constrained TypeVar, check whether each
-                        // of its constraints is equivalent to at least one constraint of
-                        // the formal TypeVar. This handles the case where two TypeVars
-                        // with identical constraint sets are used across function
-                        // boundaries.
-                        //
-                        // We require equivalence rather than assignability to maintain
-                        // soundness: constrained TypeVars allow narrowing via
-                        // `isinstance` checks inside the function body, so a constraint
-                        // that is a strict subtype (e.g. `bool` vs `int`) would allow
-                        // the callee to return a widened type that violates the caller's
-                        // constraint.
-                        if let Type::TypeVar(actual_typevar) = ty
-                            && let Some(actual_constraints) =
-                                actual_typevar.typevar(self.db).constraints(self.db)
-                        {
-                            let all_satisfied =
-                                actual_constraints.iter().all(|actual_constraint| {
-                                    typevar_constraints.elements(self.db).iter().any(
-                                        |formal_constraint| {
-                                            actual_constraint
-                                                .is_equivalent_to(self.db, *formal_constraint)
-                                        },
-                                    )
-                                });
-                            if all_satisfied {
-                                self.add_type_mapping(bound_typevar, ty, polarity, f);
-                                return Ok(());
-                            }
-                        }
-
-                        for constraint in typevar_constraints.elements(self.db) {
-                            let is_satisfied = if polarity.is_contravariant() {
-                                constraint
-                                    .when_assignable_to(
-                                        self.db,
-                                        ty,
-                                        self.constraints,
-                                        self.inferable,
-                                    )
-                                    .is_always_satisfied(self.db)
-                            } else {
-                                ty.when_assignable_to(
-                                    self.db,
-                                    *constraint,
-                                    self.constraints,
-                                    self.inferable,
-                                )
-                                .is_always_satisfied(self.db)
-                            };
-
-                            if is_satisfied {
-                                self.add_type_mapping(bound_typevar, *constraint, polarity, f);
-                                return Ok(());
-                            }
-                        }
-                        return Err(SpecializationError::MismatchedConstraint {
-                            bound_typevar,
-                            argument: ty,
-                        });
-                    }
-                    _ => self.add_type_mapping(bound_typevar, ty, polarity, f),
+            (formal, Type::TypeVar(actual_typevar))
+                if !actual_typevar.is_inferable(self.db, self.inferable) =>
+            {
+                if let Some(TypeVarBoundOrConstraints::UpperBound(bound)) = actual_typevar
+                    .typevar(self.db)
+                    .bound_or_constraints(self.db)
+                {
+                    return self.infer_map_impl(formal, bound, polarity, f, seen);
                 }
             }
 

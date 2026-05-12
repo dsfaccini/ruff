@@ -768,6 +768,25 @@ def _(c: LegacyContainer[str], d: LegacyContainer):
     reveal_type(d.method())  # revealed: LegacyContainer[bytes]
 ```
 
+Implicit `Self` should still contribute to generic function specialization when the callee's
+type variables have defaults.
+
+```py
+from typing import Generic, TypeVar
+
+TStream = TypeVar("TStream", default=None)
+UStream = TypeVar("UStream", default=str)
+THelper = TypeVar("THelper", default=None)
+UHelper = TypeVar("UHelper", default=str)
+
+class Stream(Generic[TStream, UStream]):
+    def handle(self, x: int) -> None:
+        reveal_type(helper(self, x))  # revealed: tuple[TStream@Stream, UStream@Stream]
+
+def helper(stream: Stream[THelper, UHelper], x: int) -> tuple[THelper, UHelper]:
+    raise NotImplementedError
+```
+
 ## Invalid Usage
 
 `Self` cannot be used in the signature of a function or variable.
