@@ -419,7 +419,7 @@ impl<'a> IntoIterator for &'a Suppressions {
     }
 }
 
-/// A `type: ignore` or `ty: ignore` suppression.
+/// A `type: ignore`, `ty: ignore`, or checker-specific suppression.
 ///
 /// Suppression comments that suppress multiple codes
 /// create multiple suppressions: one for every code.
@@ -459,7 +459,7 @@ pub(crate) struct Suppression {
 impl Suppression {
     fn matches(&self, tested_id: LintId) -> bool {
         match self.target {
-            SuppressionTarget::All => true,
+            SuppressionTarget::All | SuppressionTarget::ExternalAll => true,
             SuppressionTarget::Lint(suppressed_id) => tested_id == suppressed_id,
             SuppressionTarget::Empty => false,
         }
@@ -474,6 +474,7 @@ impl Suppression {
 enum SuppressionKind {
     TypeIgnore,
     Ty,
+    Pyright,
 }
 
 impl SuppressionKind {
@@ -481,10 +482,15 @@ impl SuppressionKind {
         matches!(self, SuppressionKind::TypeIgnore)
     }
 
+    const fn supports_ty_codes(self) -> bool {
+        matches!(self, SuppressionKind::TypeIgnore | SuppressionKind::Ty)
+    }
+
     fn len_utf8(self) -> usize {
         match self {
             SuppressionKind::TypeIgnore => "type".len(),
             SuppressionKind::Ty => "ty".len(),
+            SuppressionKind::Pyright => "pyright".len(),
         }
     }
 }
@@ -494,6 +500,7 @@ impl fmt::Display for SuppressionKind {
         match self {
             SuppressionKind::TypeIgnore => f.write_str("type: ignore"),
             SuppressionKind::Ty => f.write_str("ty: ignore"),
+            SuppressionKind::Pyright => f.write_str("pyright: ignore"),
         }
     }
 }
@@ -511,6 +518,14 @@ pub(crate) struct FileSuppressionId(TextRange);
 enum SuppressionTarget {
     /// Suppress all lints
     All,
+
+    /// Suppress all lints because a non-ty checker-specific code is present.
+    ///
+    /// This compatibility path lets projects adopt ty without rewriting existing
+    /// `type: ignore[<other-checker-code>]` or `pyright: ignore[...]` suppressions.
+    /// These suppressions are intentionally skipped by unused-suppression reporting
+    /// because ty cannot know whether another checker still needs them.
+    ExternalAll,
 
     /// Suppress the lint with the given id
     Lint(LintId),
@@ -619,19 +634,46 @@ impl<'a> SuppressionsBuilder<'a> {
 
             // `ty: ignore[a, b]` or `type: ignore[a, b]`
             Some(codes) => {
+                let has_ty_specific_code = comment.kind().is_type_ignore()
+                    && codes
+                        .iter()
+                        .any(|&code_range| self.source[code_range].starts_with("ty:"));
+
                 for &code_range in codes {
                     let code = &self.source[code_range];
 
-                    // For `type:ignore`, ignore codes that don't start with `ty:`.
+                    // For `type: ignore`, `ty:`-prefixed codes target ty specifically. A
+                    // foreign-only coded `type: ignore[...]` is treated as a blanket
+                    // suppression for migration compatibility with other type checkers.
                     let code = if comment.kind().is_type_ignore() {
                         if let Some(prefix) = code.strip_prefix("ty:") {
                             prefix
+                        } else if has_ty_specific_code {
+                            continue;
                         } else {
+                            push_ignore_suppression(Suppression {
+                                target: SuppressionTarget::ExternalAll,
+                                kind: comment.kind(),
+                                range: code_range,
+                                comment_range: comment.range(),
+                                suppressed_range,
+                            });
                             continue;
                         }
                     } else {
                         code
                     };
+
+                    if !comment.kind().supports_ty_codes() {
+                        push_ignore_suppression(Suppression {
+                            target: SuppressionTarget::ExternalAll,
+                            kind: comment.kind(),
+                            range: code_range,
+                            comment_range: comment.range(),
+                            suppressed_range,
+                        });
+                        continue;
+                    }
 
                     match self.lint_registry.get(code) {
                         Ok(lint) => {

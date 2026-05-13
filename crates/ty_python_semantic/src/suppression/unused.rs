@@ -72,6 +72,7 @@ pub(super) fn check_unused_suppressions(context: &mut CheckSuppressionsContext) 
         let unused_lint = match suppression.kind {
             SuppressionKind::Ty => &UNUSED_IGNORE_COMMENT,
             SuppressionKind::TypeIgnore => &UNUSED_TYPE_IGNORE_COMMENT,
+            SuppressionKind::Pyright => continue,
         };
 
         let mut diag = match suppression.target {
@@ -85,6 +86,7 @@ pub(super) fn check_unused_suppressions(context: &mut CheckSuppressionsContext) 
                     suppression.kind
                 ))
             }
+            SuppressionTarget::ExternalAll => continue,
             SuppressionTarget::Lint(lint) => {
                 // A single code in a `ty: ignore[<code1>, <code2>, ...]` directive
 

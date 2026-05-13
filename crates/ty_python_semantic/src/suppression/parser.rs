@@ -61,6 +61,8 @@ impl<'src> SuppressionParser<'src> {
             SuppressionKind::TypeIgnore
         } else if self.cursor.as_str().starts_with("ty") {
             SuppressionKind::Ty
+        } else if self.cursor.as_str().starts_with("pyright") {
+            SuppressionKind::Pyright
         } else {
             return None;
         };
@@ -447,6 +449,24 @@ mod tests {
                 kind: TypeIgnore,
                 codes: [
                     "invalid-exception-raised",
+                ],
+            },
+        ]
+        "##
+        );
+    }
+
+    #[test]
+    fn pyright_ignore_single_code() {
+        assert_debug_snapshot!(
+            SuppressionComments::new("# pyright: ignore[reportArgumentType]",),
+            @r##"
+        [
+            SuppressionComment {
+                text: "# pyright: ignore[reportArgumentType]",
+                kind: Pyright,
+                codes: [
+                    "reportArgumentType",
                 ],
             },
         ]

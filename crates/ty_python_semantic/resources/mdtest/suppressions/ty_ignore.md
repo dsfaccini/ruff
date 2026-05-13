@@ -14,6 +14,27 @@ a = 4 + test  # ty: ignore
 a = 4 + test  # ty: ignore[unresolved-reference]
 ```
 
+## Compatibility with other type checkers
+
+Coded `type: ignore` comments without a `ty:`-prefixed code are treated as blanket suppressions,
+but are not reported as unused by ty. This lets projects adopt ty without rewriting suppressions
+that are still meaningful to another checker.
+
+```py
+x: int = "not an int"  # type: ignore[assignment]
+y: int = "not an int"  # pyright: ignore[reportAssignmentType]
+```
+
+If a `type: ignore` comment includes a `ty:`-prefixed code, only those ty-specific codes suppress
+ty diagnostics.
+
+```py
+# error: [invalid-assignment]
+# error: [unused-type-ignore-comment]
+x: int = "not an int"  # type: ignore[assignment, ty:unresolved-reference]
+y: int = "not an int"  # type: ignore[assignment, ty:invalid-assignment]
+```
+
 ## Unused suppression
 
 ```py
