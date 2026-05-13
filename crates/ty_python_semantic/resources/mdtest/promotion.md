@@ -293,6 +293,34 @@ segments: Mapping[str, Any] = {"start": (1, 2), "end": (3, 4, 5)}
 reveal_type(segments)  # revealed: dict[str, tuple[int, ...]]
 ```
 
+Expected return contexts can provide a fallback for otherwise-unconstrained covariant constructor
+type variables. This should beat a TypeVar default, but should not override argument-derived
+constraints.
+
+```py
+from typing import Generic
+from typing_extensions import TypeVar
+
+T_co_default = TypeVar("T_co_default", default=str, covariant=True)
+
+class DefaultedCovariantBox(Generic[T_co_default]):
+    def __init__(self, value: T_co_default | None = None) -> None: ...
+
+class DefaultedCovariantWrapper(Generic[T_co_default]):
+    def __init__(self, box: DefaultedCovariantBox[T_co_default]) -> None: ...
+
+def defaulted_covariant_return[U](value: U) -> DefaultedCovariantBox[U]:
+    box: DefaultedCovariantBox[U] = DefaultedCovariantBox()
+    reveal_type(box)  # revealed: DefaultedCovariantBox[U@defaulted_covariant_return]
+    return DefaultedCovariantBox()
+
+def defaulted_covariant_argument[U](value: U) -> DefaultedCovariantWrapper[U]:
+    return DefaultedCovariantWrapper(DefaultedCovariantBox())
+
+def argument_constraint_wins() -> DefaultedCovariantBox[object]:
+    return DefaultedCovariantBox(1)
+```
+
 ## Invariant and contravariant return types are promoted
 
 We promote in non-covariant position in the return type of a generic function, or constructor of a

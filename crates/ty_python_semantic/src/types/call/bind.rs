@@ -4606,7 +4606,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
         // tension between type context preferences and argument constraints. If the combined set
         // is unsatisfiable, we will fall back to argument constraints alone (which the current
         // code does via `assignable_to_declared_type`).
-        let preferred_type_mappings = return_with_tcx
+        let (preferred_type_mappings, contextual_fallback_type_mappings) = return_with_tcx
             .and_then(|(return_ty, tcx)| {
                 if !tcx
                     .filter_union(self.db, |ty| ty.may_prefer_declared_type(self.db))
@@ -4643,21 +4643,14 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
 
                 let mut preferred: FxHashMap<BoundTypeVarIdentity<'db>, UnionAccumulator<'db>> =
                     FxHashMap::default();
+                let mut contextual_fallback: FxHashMap<
+                    BoundTypeVarIdentity<'db>,
+                    UnionAccumulator<'db>,
+                > = FxHashMap::default();
 
                 for solution in &solutions {
                     for binding in solution {
                         let identity = binding.bound_typevar.identity(self.db);
-
-                        // Avoid unnecessarily widening the return type based on a covariant
-                        // type parameter from the type context, as it can lead to argument
-                        // assignability errors if the type variable is constrained by a narrower
-                        // parameter type.
-                        if variance_map
-                            .get(&identity)
-                            .is_some_and(|v| v.is_covariant())
-                        {
-                            continue;
-                        }
 
                         // Filter out inferable typevars (cross-typevar references from
                         // SequentMap transitivity) and unspecialized typevars (from partially
@@ -4670,6 +4663,22 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                             true
                         });
                         if inferred_ty.has_unspecialized_type_var(self.db) {
+                            continue;
+                        }
+
+                        // Avoid unnecessarily widening the return type based on a covariant
+                        // type parameter from the type context, as it can lead to argument
+                        // assignability errors if the type variable is constrained by a narrower
+                        // parameter type. Keep it as a fallback only, so it can still beat a
+                        // TypeVar default when no argument/default constraint infers the typevar.
+                        if variance_map
+                            .get(&identity)
+                            .is_some_and(|v| v.is_covariant())
+                        {
+                            contextual_fallback
+                                .entry(identity)
+                                .and_modify(|existing| existing.add(self.db, inferred_ty))
+                                .or_insert_with(|| UnionAccumulator::new(inferred_ty));
                             continue;
                         }
 
@@ -4694,6 +4703,11 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                     .into_iter()
                     .map(|(identity, accumulator)| (identity, accumulator.into_type(self.db)))
                     .collect();
+                let contextual_fallback: FxHashMap<BoundTypeVarIdentity<'db>, Type<'db>> =
+                    contextual_fallback
+                        .into_iter()
+                        .map(|(identity, accumulator)| (identity, accumulator.into_type(self.db)))
+                        .collect();
 
                 // Add preferred types to the builder so they serve as the base mapping
                 // when argument inference adds more types.
@@ -4706,7 +4720,7 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                     }
                 }
 
-                Some(preferred)
+                Some((preferred, contextual_fallback))
             })
             .unwrap_or_default();
 
@@ -4742,6 +4756,15 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
         // override the default solution, or None to keep it.
         let maybe_promote = |typevar: BoundTypeVarInstance<'db>,
                              bounds: Option<(Type<'db>, Type<'db>)>| {
+            if bounds.is_none() {
+                if typevar.typevar(self.db).default_type(self.db).is_some() {
+                    return contextual_fallback_type_mappings
+                        .get(&typevar.identity(self.db))
+                        .copied();
+                }
+                return None;
+            }
+
             let (lower, _upper) = bounds?;
             let bound_or_constraints = typevar.typevar(self.db).bound_or_constraints(self.db);
 
