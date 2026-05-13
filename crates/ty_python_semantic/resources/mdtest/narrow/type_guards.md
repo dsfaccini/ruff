@@ -40,6 +40,24 @@ def _(a: object):
     reveal_type(g(a))  # revealed: TypeIs[str @ a]
 ```
 
+Type guard calls can narrow their target when the target argument is passed by keyword.
+
+```py
+from typing_extensions import TypeGuard, TypeIs
+
+def is_str(value: object) -> TypeGuard[str]:
+    return isinstance(value, str)
+
+def is_int(value: object) -> TypeIs[int]:
+    return isinstance(value, int)
+
+def _(x: object, y: object):
+    if is_str(value=x):
+        reveal_type(x)  # revealed: str
+    if is_int(value=y):
+        reveal_type(y)  # revealed: int
+```
+
 ## Parameters
 
 A user-defined type guard must accept at least one positional argument (in addition to `self`/`cls`
@@ -247,8 +265,8 @@ def _(d: Any):
     if f("foo"):  # TODO: error: [invalid-type-guard-call]
         ...
 
-    if g(a=d):  # error: [invalid-type-guard-call] "Type guard call does not have a target"
-        ...
+    if g(a=d):
+        reveal_type(d)  # revealed: Any & int
 ```
 
 ## Narrowing

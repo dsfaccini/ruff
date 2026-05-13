@@ -7590,8 +7590,43 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let scope = self.scope();
         let return_ty = bindings.return_type(db);
 
-        let find_narrowed_place = |argument_index: usize| match arguments.args.get(argument_index) {
-            None => {
+        let narrowed_target = || {
+            bindings
+                .single_element()
+                .and_then(|binding| {
+                    binding
+                        .signature_type
+                        .as_function_literal()
+                        .or_else(|| binding.callable_type.as_function_literal())
+                        .map(|function| {
+                            let has_implicit_receiver = function.has_implicit_receiver(db);
+                            (
+                                usize::from(has_implicit_receiver && binding.bound_type.is_none()),
+                                usize::from(has_implicit_receiver),
+                            )
+                        })
+                })
+                .unwrap_or((0, 0))
+        };
+
+        let find_narrowed_place = |argument_index: usize, parameter_index: usize| {
+            let expr = arguments.args.get(argument_index).or_else(|| {
+                let parameter_name = bindings
+                    .single_element()
+                    .and_then(|binding| binding.matching_overloads().exactly_one().ok())
+                    .and_then(|(_, overload)| overload.signature.parameters().get(parameter_index))
+                    .and_then(|parameter| parameter.name())?;
+
+                arguments.keywords.iter().find_map(|keyword| {
+                    keyword
+                        .arg
+                        .as_ref()
+                        .is_some_and(|arg| arg.id == *parameter_name)
+                        .then_some(&keyword.value)
+                })
+            });
+
+            let Some(expr) = expr else {
                 // This branch looks extraneous, especially in the face of `missing-arguments`.
                 // However, that lint won't be able to catch this:
                 //
@@ -7608,40 +7643,29 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 {
                     builder.into_diagnostic("Type guard call does not have a target");
                 }
-                None
-            }
-            Some(expr) => match PlaceExpr::try_from_expr(expr) {
+                return None;
+            };
+
+            match PlaceExpr::try_from_expr(expr) {
                 Some(place_expr) => place_table(db, scope).place_id(&place_expr),
                 None => None,
-            },
+            }
         };
 
-        let narrowed_argument_index = || {
-            bindings
-                .single_element()
-                .and_then(|binding| {
-                    binding
-                        .signature_type
-                        .as_function_literal()
-                        .or_else(|| binding.callable_type.as_function_literal())
-                        .map(|function| {
-                            usize::from(
-                                function.has_implicit_receiver(db) && binding.bound_type.is_none(),
-                            )
-                        })
-                })
-                .unwrap_or(0)
-        };
-
+        let (narrowed_argument_index, narrowed_parameter_index) = narrowed_target();
         match return_ty {
-            Type::TypeIs(type_is) => match find_narrowed_place(narrowed_argument_index()) {
-                Some(place) => type_is.bind(db, scope, place),
-                None => return_ty,
-            },
-            Type::TypeGuard(type_guard) => match find_narrowed_place(narrowed_argument_index()) {
-                Some(place) => type_guard.bind(db, scope, place),
-                None => return_ty,
-            },
+            Type::TypeIs(type_is) => {
+                match find_narrowed_place(narrowed_argument_index, narrowed_parameter_index) {
+                    Some(place) => type_is.bind(db, scope, place),
+                    None => return_ty,
+                }
+            }
+            Type::TypeGuard(type_guard) => {
+                match find_narrowed_place(narrowed_argument_index, narrowed_parameter_index) {
+                    Some(place) => type_guard.bind(db, scope, place),
+                    None => return_ty,
+                }
+            }
             _ => return_ty,
         }
     }

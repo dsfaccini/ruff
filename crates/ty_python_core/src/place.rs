@@ -685,6 +685,14 @@ impl<'db, 'a> PossiblyNarrowedPlacesBuilder<'db, 'a> {
                 }
             }
         }
+        for keyword in &expr_call.arguments.keywords {
+            if keyword.arg.is_some()
+                && let Some(place_expr) = PlaceExpr::try_from_expr(&keyword.value)
+                && let Some(place) = self.places.place_id((&place_expr).into())
+            {
+                places.insert(place);
+            }
+        }
 
         // `bool(expr)` can delegate to narrowing `expr` itself, e.g. `bool(x is not None)`
         if let Some(first_arg) = expr_call.arguments.args.first() {
