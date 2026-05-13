@@ -223,12 +223,13 @@ impl ProjectDatabase {
             }
         }
 
-        for path in deduplicate_nested_paths(sync_recursively) {
-            Files::sync_recursively(self, &path);
-        }
+        let sync_recursively = deduplicate_nested_paths(sync_recursively).collect::<Vec<_>>();
+        Files::sync_all_recursive(self, &sync_recursively);
 
-        for path in deduplicate_nested_paths(recursive_deletes) {
-            Files::sync_recursively(self, &path);
+        let recursive_deletes = deduplicate_nested_paths(recursive_deletes).collect::<Vec<_>>();
+        Files::sync_all_recursive(self, &recursive_deletes);
+
+        for path in recursive_deletes {
             project.remove_files_under(self, &path);
         }
 
