@@ -1892,6 +1892,28 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
         }
     }
 
+    fn extend_type_mappings_prefer_narrower(
+        &mut self,
+        types: impl IntoIterator<Item = (BoundTypeVarIdentity<'db>, UnionAccumulator<'db>)>,
+    ) {
+        for (identity, accumulator) in types {
+            let ty = accumulator.into_type(self.db);
+            match self.types.entry(identity) {
+                Entry::Occupied(mut entry) => {
+                    let existing = entry.get_mut().get_or_build(self.db);
+                    if ty.is_subtype_of(self.db, existing) {
+                        entry.insert(UnionAccumulator::new(ty));
+                    } else {
+                        entry.get_mut().add(self.db, ty);
+                    }
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(UnionAccumulator::new(ty));
+                }
+            }
+        }
+    }
+
     fn add_type_mapping(
         &mut self,
         bound_typevar: BoundTypeVarInstance<'db>,
@@ -2117,7 +2139,7 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
                 )
                 .map_err(|_| ())?;
         }
-        self.extend_type_mappings(return_builder.types);
+        self.extend_type_mappings_prefer_narrower(return_builder.types);
         Ok(())
     }
 
@@ -2284,6 +2306,98 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
             // For now, we punt on fully handling multiple typevar elements. Instead, we handle two
             // common cases specially:
             (Type::Union(formal_union), Type::Union(actual_union)) => {
+                // If both sides are unions with a single bare typevar, and every other actual
+                // union element is covered by exactly one non-bare formal union element, infer
+                // the formal typevar from the actual typevar. This handles higher-order aliases
+                // like `Callable[..., Awaitable[U] | U]` matched against
+                // `Callable[..., Awaitable[T] | T]`: the correct solution is `U = T`, not
+                // `U = Awaitable[T] | T`.
+                let bare_formal_typevars = formal_union
+                    .elements(self.db)
+                    .iter()
+                    .filter_map(|ty| ty.as_typevar());
+                if let Ok(formal_bound_typevar) = bare_formal_typevars.exactly_one()
+                    && formal_bound_typevar.is_inferable(self.db, self.inferable)
+                {
+                    let bare_actual_typevars = actual_union
+                        .elements(self.db)
+                        .iter()
+                        .filter(|ty| ty.is_type_var());
+
+                    if let Ok(actual_typevar) = bare_actual_typevars.exactly_one() {
+                        let mut element_builder =
+                            SpecializationBuilder::new(self.db, self.constraints, self.inferable);
+                        let mut all_actual_elements_matched = true;
+
+                        for actual_element in actual_union.elements(self.db) {
+                            if actual_element == actual_typevar {
+                                continue;
+                            }
+
+                            let matching_formal_elements = formal_union
+                                .elements(self.db)
+                                .iter()
+                                .copied()
+                                .filter(|formal_element| {
+                                    if formal_element.is_type_var() {
+                                        return false;
+                                    }
+
+                                    if formal_element.has_typevar(self.db)
+                                        && formal_element.variance_of(self.db, formal_bound_typevar)
+                                            != TypeVarVariance::Covariant
+                                    {
+                                        return false;
+                                    }
+
+                                    !actual_element
+                                        .when_assignable_to(
+                                            self.db,
+                                            *formal_element,
+                                            self.constraints,
+                                            self.inferable,
+                                        )
+                                        .is_never_satisfied(self.db)
+                                });
+
+                            let Ok(matching_formal_element) =
+                                matching_formal_elements.exactly_one()
+                            else {
+                                all_actual_elements_matched = false;
+                                break;
+                            };
+
+                            if matching_formal_element.has_typevar(self.db) {
+                                let mut element_seen = seen.clone();
+                                if element_builder
+                                    .infer_map_impl(
+                                        matching_formal_element,
+                                        *actual_element,
+                                        polarity,
+                                        &mut f,
+                                        &mut element_seen,
+                                    )
+                                    .is_err()
+                                {
+                                    all_actual_elements_matched = false;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if all_actual_elements_matched {
+                            element_builder.infer_bare_typevar_mapping(
+                                formal_bound_typevar,
+                                *actual_typevar,
+                                polarity,
+                                &mut f,
+                            )?;
+                            self.extend_type_mappings(element_builder.types);
+                            return Ok(());
+                        }
+                    }
+                }
+
                 // If both sides are unions, infer from actual elements that match exactly one
                 // non-bare generic formal element. This handles parameters like
                 // `str | C[T] | None` when the argument is `str | C[int] | None` without

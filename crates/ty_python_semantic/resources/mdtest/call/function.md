@@ -119,6 +119,41 @@ def outer_typevar(x: MaybeBox[T]) -> MaybeBox[T]:
     return normalize(x)
 ```
 
+## Callable return unions with outer type variables
+
+When a generic callable alias returns a union containing its type variable, matching it against the
+same alias with an outer type variable should preserve the outer variable instead of solving to the
+entire return union.
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+```py
+from collections.abc import Awaitable, Callable, Sequence
+from typing import Generic, TypeVar
+from typing_extensions import TypeAliasType
+
+T = TypeVar("T")
+T_co = TypeVar("T_co", covariant=True)
+
+OutputTypeOrFunction = TypeAliasType(
+    "OutputTypeOrFunction",
+    type[T_co] | Callable[..., Awaitable[T_co] | T_co],
+    type_params=(T_co,),
+)
+
+class Processor(Generic[T]):
+    def __init__(self, output: OutputTypeOrFunction[T]) -> None:
+        self.output = output
+
+def build(outputs: Sequence[OutputTypeOrFunction[T]]) -> Processor[T]:
+    reveal_type(outputs[0])  # revealed: type[T@build] | ((...) -> Awaitable[T@build] | T@build)
+    reveal_type(Processor(output=outputs[0]))  # revealed: Processor[T@build]
+    return Processor(output=outputs[0])
+```
+
 ## Decorated
 
 ```py
