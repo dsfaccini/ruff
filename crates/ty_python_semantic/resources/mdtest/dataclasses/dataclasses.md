@@ -154,6 +154,20 @@ class BadWithInitFalse:
     y: str = field(init=False)
     # error: [dataclass-field-order] "Required field `z` cannot be defined after fields with default values"
     z: float
+
+@dataclass(init=False)
+class GoodDataclassInitFalse:
+    x: int = 1
+    y: str
+
+@dataclass(kw_only=True)
+class GoodBaseWithInit:
+    x: int
+
+@dataclass(init=False)
+class GoodChildWithInitFalse(GoodBaseWithInit):
+    y: str | None = None
+    z: float
 ```
 
 Keyword-only fields (using `kw_only=True`) also don't participate in the positional ordering check:

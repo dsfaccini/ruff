@@ -13,9 +13,9 @@ use crate::{
     diagnostic::format_enumeration,
     place::{place_from_bindings, place_from_declarations},
     types::{
-        CallArguments, ClassBase, ClassLiteral, ClassType, GenericAlias, KnownInstanceType,
-        MemberLookupPolicy, MetaclassCandidate, Parameters, Signature, SpecialFormType,
-        StaticClassLiteral, Type, binding_type,
+        CallArguments, ClassBase, ClassLiteral, ClassType, DataclassFlags, GenericAlias,
+        KnownInstanceType, MemberLookupPolicy, MetaclassCandidate, Parameters, Signature,
+        SpecialFormType, StaticClassLiteral, Type, binding_type,
         call::Argument,
         class::{
             AbstractMethod, CodeGeneratorKind, FieldKind, MetaclassErrorKind,
@@ -945,6 +945,7 @@ pub(crate) fn check_static_class_definitions<'db>(
         let specialization = None;
 
         let mut kw_only_sentinel_fields = vec![];
+        let check_field_order = class.has_dataclass_param(db, field_policy, DataclassFlags::INIT);
         let mut required_after_default_field_names = vec![];
         let mut has_seen_default_field = false;
 
@@ -964,6 +965,10 @@ pub(crate) fn check_static_class_definitions<'db>(
             else {
                 continue;
             };
+
+            if !check_field_order {
+                continue;
+            }
 
             // Fields with init=False or kw_only=true don't participate in ordering check
             if !init || *kw_only == Some(true) {
