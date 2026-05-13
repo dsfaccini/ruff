@@ -2226,6 +2226,57 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
         )
     }
 
+    fn infer_identity_typevar_mappings(
+        &mut self,
+        ty: Type<'db>,
+        polarity: TypeVarVariance,
+        f: &mut dyn FnMut(TypeVarAssignment<'db>) -> Option<Type<'db>>,
+    ) -> Result<(), SpecializationError<'db>> {
+        struct CollectInferableTypeVars<'db> {
+            inferable: InferableTypeVars<'db>,
+            typevars: RefCell<FxOrderSet<BoundTypeVarInstance<'db>>>,
+            recursion_guard: TypeCollector<'db>,
+        }
+
+        impl<'db> TypeVisitor<'db> for CollectInferableTypeVars<'db> {
+            fn should_visit_lazy_type_attributes(&self) -> bool {
+                false
+            }
+
+            fn visit_bound_type_var_type(
+                &self,
+                db: &'db dyn Db,
+                bound_typevar: BoundTypeVarInstance<'db>,
+            ) {
+                if bound_typevar.identity(db).is_inferable(db, self.inferable) {
+                    self.typevars.borrow_mut().insert(bound_typevar);
+                }
+            }
+
+            fn visit_type(&self, db: &'db dyn Db, ty: Type<'db>) {
+                walk_type_with_recursion_guard(db, ty, self, &self.recursion_guard);
+            }
+        }
+
+        let visitor = CollectInferableTypeVars {
+            inferable: self.inferable,
+            typevars: RefCell::default(),
+            recursion_guard: TypeCollector::default(),
+        };
+        visitor.visit_type(self.db, ty);
+
+        for bound_typevar in visitor.typevars.into_inner() {
+            let variance = ty.variance_of(self.db, bound_typevar).compose(polarity);
+            self.infer_bare_typevar_mapping(
+                bound_typevar,
+                Type::TypeVar(bound_typevar),
+                variance,
+                f,
+            )?;
+        }
+        Ok(())
+    }
+
     fn infer_map_impl(
         &mut self,
         formal: Type<'db>,
@@ -2244,6 +2295,7 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
         // example.
 
         if formal == actual {
+            self.infer_identity_typevar_mappings(formal, polarity, f)?;
             return Ok(());
         }
 

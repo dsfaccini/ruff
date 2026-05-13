@@ -1177,6 +1177,28 @@ def build(output: OutputType[T]) -> Base[T]:
     return Processor(output)
 ```
 
+Constructor inference preserves an outer type variable when the argument type exactly matches a
+generic wrapper around the constructor's type variable.
+
+```py
+from collections.abc import Callable
+from typing import Generic
+from typing_extensions import TypeVar
+
+T = TypeVar("T", default=None)
+
+class Base(Generic[T]): ...
+
+class Dynamic(Base[T]):
+    def __init__(self, f: Callable[[T], Base[T] | None]) -> None:
+        self.f = f
+
+    def copy(self) -> Base[T]:
+        reveal_type(self.f)  # revealed: (T@Dynamic, /) -> Base[T@Dynamic] | None
+        reveal_type(Dynamic(self.f))  # revealed: Dynamic[T@Dynamic]
+        return Dynamic(self.f)
+```
+
 ## Generic constructor inference from overloaded `__init__` self types
 
 ```py
