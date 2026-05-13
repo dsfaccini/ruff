@@ -2236,6 +2236,29 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
             {
                 return self.infer_bare_typevar_mapping(bound_typevar, ty, polarity, f);
             }
+            (Type::TypeAlias(formal_alias), Type::TypeAlias(actual_alias))
+                if formal_alias.definition(self.db) == actual_alias.definition(self.db) =>
+            {
+                let Some(generic_context) = formal_alias.generic_context(self.db) else {
+                    return Ok(());
+                };
+                let formal_specialization = formal_alias
+                    .specialization(self.db)
+                    .unwrap_or_else(|| generic_context.default_specialization(self.db, None));
+                let actual_specialization = actual_alias
+                    .specialization(self.db)
+                    .unwrap_or_else(|| generic_context.default_specialization(self.db, None));
+
+                for (typevar, formal_ty, actual_ty) in itertools::izip!(
+                    generic_context.variables(self.db),
+                    formal_specialization.types(self.db),
+                    actual_specialization.types(self.db)
+                ) {
+                    let variance = typevar.variance_with_polarity(self.db, polarity);
+                    self.infer_map_impl(*formal_ty, *actual_ty, variance, &mut f, seen)?;
+                }
+                return Ok(());
+            }
             _ => {}
         }
 

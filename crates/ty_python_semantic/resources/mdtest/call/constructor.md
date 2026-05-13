@@ -1156,6 +1156,27 @@ def build(x: Sequence[Base[T]] | None) -> Derived[T]:
     return Derived(xs)
 ```
 
+Generic constructor inference can infer through matching specialized `TypeAliasType` aliases.
+
+```py
+from collections.abc import Callable
+from typing import Generic
+from typing_extensions import TypeAliasType, TypeVar
+
+T = TypeVar("T", default=str)
+
+OutputType = TypeAliasType("OutputType", type[T] | Callable[..., T], type_params=(T,))
+
+class Base(Generic[T]): ...
+
+class Processor(Base[T]):
+    def __init__(self, output: OutputType[T]) -> None: ...
+
+def build(output: OutputType[T]) -> Base[T]:
+    reveal_type(Processor(output))  # revealed: Processor[T@build]
+    return Processor(output)
+```
+
 ## Generic constructor inference from overloaded `__init__` self types
 
 ```py
