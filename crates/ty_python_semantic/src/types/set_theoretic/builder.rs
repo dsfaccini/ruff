@@ -40,9 +40,9 @@ use super::RecursivelyDefined;
 use crate::types::enums::{enum_member_literals, enum_metadata};
 use crate::types::set_theoretic::expand_intersection_typevars_and_newtypes;
 use crate::types::{
-    BytesLiteralType, ClassLiteral, EnumLiteralType, IntersectionType, KnownClass,
-    LiteralValueType, LiteralValueTypeKind, NegativeIntersectionElements, StringLiteralType, Type,
-    TypeVarBoundOrConstraints, UnionType,
+    BytesLiteralType, ClassBase, ClassLiteral, ClassType, EnumLiteralType, GenericAlias,
+    IntersectionType, KnownClass, LiteralValueType, LiteralValueTypeKind,
+    NegativeIntersectionElements, StringLiteralType, Type, TypeVarBoundOrConstraints, UnionType,
 };
 use crate::{Db, FxOrderMap, FxOrderSet};
 use smallvec::SmallVec;
@@ -1229,6 +1229,76 @@ struct InnerIntersectionBuilder<'db> {
     negative: NegativeIntersectionElements<'db>,
 }
 
+fn specialize_subclass_from_existing_base<'db>(
+    db: &'db dyn Db,
+    subclass_ty: Type<'db>,
+    base_ty: Type<'db>,
+) -> Option<Type<'db>> {
+    let subclass_alias = subclass_ty
+        .as_nominal_instance()?
+        .class(db)
+        .into_generic_alias()?;
+    let base_alias = base_ty
+        .as_nominal_instance()?
+        .class(db)
+        .into_generic_alias()?;
+    let subclass_origin = subclass_alias.origin(db);
+    if subclass_origin == base_alias.origin(db) {
+        return None;
+    }
+
+    let subclass_context = subclass_origin.generic_context(db)?;
+    let subclass_variables = subclass_context.variables(db).collect::<Vec<_>>();
+    let identity_specialization = subclass_context.identity_specialization(db);
+
+    for mro_base in subclass_origin.iter_mro(db, Some(identity_specialization)) {
+        let ClassBase::Class(ClassType::Generic(mro_base_alias)) = mro_base else {
+            continue;
+        };
+        if mro_base_alias.origin(db) != base_alias.origin(db) {
+            continue;
+        }
+
+        let mut inferred_types = vec![None; subclass_variables.len()];
+        for (mro_base_ty, base_ty) in mro_base_alias
+            .specialization(db)
+            .types(db)
+            .iter()
+            .zip(base_alias.specialization(db).types(db))
+        {
+            let Type::TypeVar(mro_base_typevar) = *mro_base_ty else {
+                continue;
+            };
+            let Some(index) = subclass_variables
+                .iter()
+                .position(|variable| *variable == mro_base_typevar)
+            else {
+                continue;
+            };
+            inferred_types[index] = Some(*base_ty);
+        }
+
+        if inferred_types.iter().all(Option::is_none) {
+            continue;
+        }
+
+        let specialized_types = subclass_alias
+            .specialization(db)
+            .types(db)
+            .iter()
+            .enumerate()
+            .map(|(index, current_ty)| inferred_types[index].unwrap_or(*current_ty))
+            .collect::<Vec<_>>();
+        let specialization = subclass_context.specialize(db, specialized_types);
+        return Some(Type::instance(
+            db,
+            ClassType::Generic(GenericAlias::new(db, subclass_origin, specialization)),
+        ));
+    }
+
+    None
+}
+
 impl<'db> InnerIntersectionBuilder<'db> {
     /// Adds a positive type to this intersection.
     fn add_positive(&mut self, db: &'db dyn Db, mut new_positive: Type<'db>) {
@@ -1297,6 +1367,15 @@ impl<'db> InnerIntersectionBuilder<'db> {
             }
 
             _ => {
+                for existing_positive in &self.positive {
+                    if let Some(specialized) =
+                        specialize_subclass_from_existing_base(db, new_positive, *existing_positive)
+                    {
+                        new_positive = specialized;
+                        break;
+                    }
+                }
+
                 let positive_as_instance = new_positive.as_nominal_instance();
 
                 if let Some(instance) = positive_as_instance

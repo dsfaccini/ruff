@@ -20,6 +20,37 @@ def _(flag: bool):
         reveal_type(x)  # revealed: Literal[1, "a"]
 ```
 
+## `classinfo` is a generic subclass of an already-specialized base
+
+`isinstance()` checks only the runtime class, not type arguments. When the checked value already has
+a generic base-class specialization, narrowing to a generic subclass preserves the corresponding
+specialization.
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+```py
+from typing import Generic, TypeVar
+
+T = TypeVar("T", contravariant=True, default=None)
+
+class Abstract(Generic[T]):
+    def use(self, value: T) -> None: ...
+
+class Function(Abstract[T]): ...
+
+def wrap(value: Function[T]) -> Abstract[T]:
+    return value
+
+def f(value: Abstract[T]) -> Abstract[T]:
+    if isinstance(value, Function):
+        reveal_type(value)  # revealed: Function[T@f]
+        return wrap(value)
+    return value
+```
+
 ## `classinfo` is a tuple of types
 
 Note: `isinstance(x, (int, str))` should not be confused with `isinstance(x, tuple[(int, str)])`.
