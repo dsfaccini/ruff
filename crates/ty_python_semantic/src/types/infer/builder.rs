@@ -18,7 +18,7 @@ use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use strum::IntoEnumIterator;
-use ty_module_resolver::{KnownModule, ModuleName, resolve_module};
+use ty_module_resolver::{KnownModule, ModuleName, file_to_module, resolve_module};
 use ty_python_core::ast_ids::HasScopedUseId;
 use ty_python_core::statement::StatementInner;
 
@@ -9217,38 +9217,121 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
                 let range = TextRange::new(left.start(), right.end());
 
-                let ty = comparisons::infer_binary_type_comparison(
-                    &builder.context,
-                    left_ty,
-                    *op,
-                    right_ty,
-                    range,
-                    &BinaryComparisonVisitor::new(Ok(Type::bool_literal(true))),
-                )
-                .unwrap_or_else(|error| {
-                    report_unsupported_comparison(
-                        &builder.context,
-                        &error,
-                        range,
-                        left,
-                        right,
-                        left_ty,
-                        right_ty,
-                    );
+                let ty = builder
+                    .infer_packaging_version_major_comparison(left, *op, right)
+                    .unwrap_or_else(|| {
+                        comparisons::infer_binary_type_comparison(
+                            &builder.context,
+                            left_ty,
+                            *op,
+                            right_ty,
+                            range,
+                            &BinaryComparisonVisitor::new(Ok(Type::bool_literal(true))),
+                        )
+                        .unwrap_or_else(|error| {
+                            report_unsupported_comparison(
+                                &builder.context,
+                                &error,
+                                range,
+                                left,
+                                right,
+                                left_ty,
+                                right_ty,
+                            );
 
-                    match op {
-                        // `in, not in, is, is not` always return bool instances
-                        ast::CmpOp::In | ast::CmpOp::NotIn | ast::CmpOp::Is | ast::CmpOp::IsNot => {
-                            KnownClass::Bool.to_instance(builder.db())
-                        }
-                        // Other operators can return arbitrary types
-                        _ => Type::unknown(),
-                    }
-                });
+                            match op {
+                                // `in, not in, is, is not` always return bool instances
+                                ast::CmpOp::In
+                                | ast::CmpOp::NotIn
+                                | ast::CmpOp::Is
+                                | ast::CmpOp::IsNot => KnownClass::Bool.to_instance(builder.db()),
+                                // Other operators can return arbitrary types
+                                _ => Type::unknown(),
+                            }
+                        })
+                    });
 
                 (ty, range)
             },
         )
+    }
+
+    fn infer_packaging_version_major_comparison(
+        &self,
+        left: &ast::Expr,
+        op: ast::CmpOp,
+        right: &ast::Expr,
+    ) -> Option<Type<'db>> {
+        let (major, literal) = match (
+            self.packaging_version_parse_major(left),
+            self.expression_type(right).as_int_literal(),
+        ) {
+            (Some(major), Some(literal)) => (major, literal),
+            _ => match (
+                self.packaging_version_parse_major(right),
+                self.expression_type(left).as_int_literal(),
+            ) {
+                (Some(major), Some(literal)) => (literal, major),
+                _ => return None,
+            },
+        };
+
+        let result = match op {
+            ast::CmpOp::Eq => major == literal,
+            ast::CmpOp::NotEq => major != literal,
+            ast::CmpOp::Lt => major < literal,
+            ast::CmpOp::LtE => major <= literal,
+            ast::CmpOp::Gt => major > literal,
+            ast::CmpOp::GtE => major >= literal,
+            ast::CmpOp::In | ast::CmpOp::NotIn | ast::CmpOp::Is | ast::CmpOp::IsNot => {
+                return None;
+            }
+        };
+
+        Some(Type::bool_literal(result))
+    }
+
+    fn packaging_version_parse_major(&self, expr: &ast::Expr) -> Option<i64> {
+        let ast::Expr::Attribute(attribute) = expr else {
+            return None;
+        };
+        if attribute.attr.as_str() != "major" {
+            return None;
+        }
+
+        let ast::Expr::Call(call) = &*attribute.value else {
+            return None;
+        };
+        if !self.is_packaging_version_parse_call(call) {
+            return None;
+        }
+
+        let [version_expr] = &call.arguments.args[..] else {
+            return None;
+        };
+        if !call.arguments.keywords.is_empty() {
+            return None;
+        }
+
+        let version = self
+            .expression_type(version_expr)
+            .as_string_literal()
+            .map(|version| version.value(self.db()))?;
+        let major = version.split('.').next()?.parse().ok()?;
+
+        Some(major)
+    }
+
+    fn is_packaging_version_parse_call(&self, call: &ast::ExprCall) -> bool {
+        let Type::FunctionLiteral(function) = self.expression_type(&call.func) else {
+            return false;
+        };
+        if function.name(self.db()).as_str() != "parse" {
+            return false;
+        }
+
+        file_to_module(self.db(), function.file(self.db()))
+            .is_some_and(|module| module.name(self.db()).as_str() == "packaging.version")
     }
 
     fn infer_type_parameters(&mut self, type_parameters: &ast::TypeParams) {

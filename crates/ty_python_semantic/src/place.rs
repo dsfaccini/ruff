@@ -1,9 +1,11 @@
 use itertools::Either;
 use ruff_db::files::File;
+use ruff_db::parsed::parsed_module;
 use ruff_index::IndexVec;
-use ruff_python_ast::PythonVersion;
+use ruff_python_ast::{self as ast, PythonVersion};
 use ty_module_resolver::{
     KnownModule, Module, ModuleName, file_to_module, resolve_module_confident,
+    resolve_real_shadowable_module,
 };
 
 use crate::dunder_all::dunder_all_names;
@@ -1183,6 +1185,12 @@ fn symbol_impl<'db>(
         }
     }
 
+    if name == "__version__"
+        && let Some(version) = static_module_dunder_version(db, scope.file(db))
+    {
+        return Place::bound(Type::string_literal(db, &version)).into();
+    }
+
     place_table(db, scope)
         .symbol_id(name)
         .map(|symbol| {
@@ -1195,6 +1203,61 @@ fn symbol_impl<'db>(
             )
         })
         .unwrap_or_default()
+}
+
+fn static_module_dunder_version(db: &dyn Db, file: File) -> Option<String> {
+    static_module_dunder_version_from_file(db, file).or_else(|| {
+        let module_name = file_to_module(db, file)?.name(db);
+        let real_module = resolve_real_shadowable_module(db, file, module_name)?;
+        let real_file = real_module.file(db)?;
+        (real_file != file).then(|| static_module_dunder_version_from_file(db, real_file))?
+    })
+}
+
+fn static_module_dunder_version_from_file(db: &dyn Db, file: File) -> Option<String> {
+    let module = parsed_module(db, file).load(db);
+    let mut version = None;
+
+    for stmt in module.suite() {
+        let value = match stmt {
+            ast::Stmt::Assign(assign)
+                if assign.targets.iter().any(|target| {
+                    target
+                        .as_name_expr()
+                        .is_some_and(|name| name.id == "__version__")
+                }) =>
+            {
+                &*assign.value
+            }
+            ast::Stmt::AnnAssign(assign)
+                if assign
+                    .target
+                    .as_name_expr()
+                    .is_some_and(|name| name.id == "__version__") =>
+            {
+                let Some(value) = &assign.value else {
+                    return None;
+                };
+                &**value
+            }
+            _ => continue,
+        };
+
+        let ast::Expr::StringLiteral(literal) = value else {
+            return None;
+        };
+        let literal_value = literal.value.to_str();
+
+        if version
+            .as_deref()
+            .is_some_and(|existing| existing != literal_value)
+        {
+            return None;
+        }
+        version = Some(literal_value.to_string());
+    }
+
+    version
 }
 
 fn place_impl<'db>(

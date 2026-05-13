@@ -149,3 +149,61 @@ TYPE_CHECKING: Literal[False] = ...
 # error: [invalid-type-checking-constant]
 TYPE_CHECKING: object = "str"
 ```
+
+## Package `__version__`
+
+Top-level package `__version__` string assignments are preserved as literals, including when a
+stub file provides the public annotation and the runtime implementation provides the value. This
+allows package-version gates to be evaluated statically.
+
+`packaging/__init__.py`:
+
+```py
+```
+
+`packaging/version.py`:
+
+```py
+class Version:
+    major: int
+
+def parse(version: str) -> Version:
+    return Version()
+```
+
+`google/__init__.py`:
+
+```py
+```
+
+`google/protobuf/__init__.pyi`:
+
+```pyi
+from typing import Final
+
+__version__: Final[str]
+```
+
+`google/protobuf/__init__.py`:
+
+```py
+__version__ = "6.33.5"
+```
+
+```py
+from typing_extensions import reveal_type
+from packaging import version
+import google.protobuf
+
+reveal_type(google.protobuf.__version__)  # revealed: Literal["6.33.5"]
+reveal_type(version.parse(google.protobuf.__version__).major == 6)  # revealed: Literal[True]
+
+if version.parse(google.protobuf.__version__).major == 5:
+    selected = "v5"
+elif version.parse(google.protobuf.__version__).major == 6:
+    selected = "v6"
+else:
+    selected = "unsupported"
+
+reveal_type(selected)  # revealed: Literal["v6"]
+```
