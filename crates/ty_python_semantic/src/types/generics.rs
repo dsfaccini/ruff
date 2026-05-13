@@ -2284,6 +2284,64 @@ impl<'db, 'c> SpecializationBuilder<'db, 'c> {
             // For now, we punt on fully handling multiple typevar elements. Instead, we handle two
             // common cases specially:
             (Type::Union(formal_union), Type::Union(actual_union)) => {
+                // If both sides are unions, infer from actual elements that match exactly one
+                // non-bare generic formal element. This handles parameters like
+                // `str | C[T] | None` when the argument is `str | C[int] | None` without
+                // falling back to `T`'s default.
+                let formal_has_bare_typevar = formal_union
+                    .elements(self.db)
+                    .iter()
+                    .any(|formal_element| formal_element.is_type_var());
+                if !formal_has_bare_typevar {
+                    let mut inferred_from_generic_elements = false;
+                    for actual_element in actual_union.elements(self.db) {
+                        if actual_element.is_unknown() {
+                            continue;
+                        }
+
+                        let matching_formal_elements =
+                            formal_union.elements(self.db).iter().copied().filter(
+                                |formal_element| {
+                                    formal_element.has_typevar(self.db)
+                                        && !actual_element
+                                            .when_assignable_to(
+                                                self.db,
+                                                *formal_element,
+                                                self.constraints,
+                                                self.inferable,
+                                            )
+                                            .is_never_satisfied(self.db)
+                                },
+                            );
+
+                        let Ok(matching_formal_element) = matching_formal_elements.exactly_one()
+                        else {
+                            continue;
+                        };
+
+                        let mut element_builder =
+                            SpecializationBuilder::new(self.db, self.constraints, self.inferable);
+                        let mut element_seen = seen.clone();
+                        if element_builder
+                            .infer_map_impl(
+                                matching_formal_element,
+                                *actual_element,
+                                polarity,
+                                &mut f,
+                                &mut element_seen,
+                            )
+                            .is_ok()
+                        {
+                            inferred_from_generic_elements = true;
+                            self.extend_type_mappings(element_builder.types);
+                        }
+                    }
+
+                    if inferred_from_generic_elements {
+                        return Ok(());
+                    }
+                }
+
                 // First, if both formal and actual are unions, and precisely one formal union
                 // element _is_ a typevar (not _contains_ a typevar), then we remove any actual
                 // union elements that are a subtype of the formal (as a whole), and map the formal

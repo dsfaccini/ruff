@@ -89,6 +89,36 @@ def get_int[T]() -> int:
 reveal_type(get_int())  # revealed: int
 ```
 
+## Generic union elements with defaulted type variables
+
+Generic function calls infer type variables through matching generic union elements rather than
+falling back to type-variable defaults.
+
+```toml
+[environment]
+python-version = "3.13"
+```
+
+```py
+from typing import Generic, TypeVar
+
+T = TypeVar("T", default=None)
+
+class Box(Generic[T]): ...
+
+MaybeBox = str | Box[T] | None
+
+def normalize(x: MaybeBox[T]) -> MaybeBox[T]:
+    raise NotImplementedError
+
+def explicit_type_arg(x: MaybeBox[int]) -> None:
+    reveal_type(normalize(x))  # revealed: str | Box[int] | None
+
+def outer_typevar(x: MaybeBox[T]) -> MaybeBox[T]:
+    reveal_type(normalize(x))  # revealed: str | Box[T@outer_typevar] | None
+    return normalize(x)
+```
+
 ## Decorated
 
 ```py
