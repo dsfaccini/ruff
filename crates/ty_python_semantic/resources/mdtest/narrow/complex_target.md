@@ -403,6 +403,47 @@ def _(x: tuple[Literal["tag1"], A] | tuple[Literal["tag2"], B] | list[int]):
         reveal_type(x)  # revealed: tuple[Literal["tag1"], A] | list[int]
 ```
 
+### Tagged unions of objects (attribute equality narrowing)
+
+Narrow unions of objects based on literal tag attributes using `==` comparison:
+
+```py
+from typing import Literal
+
+class Text:
+    type: Literal["text"]
+    text: str
+
+class Thinking:
+    type: Literal["thinking"]
+    thinking: str
+
+class Other:
+    type: str
+    other: bytes
+
+def _(x: Text | Thinking):
+    if x.type == "text":
+        reveal_type(x)  # revealed: Text
+        reveal_type(x.text)  # revealed: str
+    elif x.type == "thinking":
+        reveal_type(x)  # revealed: Thinking
+        reveal_type(x.thinking)  # revealed: str
+
+def _(x: Text | Thinking):
+    if "text" != x.type:
+        reveal_type(x)  # revealed: Thinking
+    else:
+        reveal_type(x)  # revealed: Text
+
+def _(x: Text | Other):
+    # Equality narrowing is unsafe when a matching attribute has a non-literal type.
+    if x.type == "text":
+        reveal_type(x)  # revealed: Text | Other
+    else:
+        reveal_type(x)  # revealed: Other
+```
+
 ### PEP 695 type aliases
 
 Tuple narrowing also works when the union is defined via a PEP 695 type alias:

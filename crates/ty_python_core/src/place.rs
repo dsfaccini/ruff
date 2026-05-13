@@ -654,11 +654,17 @@ impl<'db, 'a> PossiblyNarrowedPlacesBuilder<'db, 'a> {
             self.add_narrowing_target(comparator, &mut places);
         }
 
-        // For subscript expressions on either side, the subscript base can also be narrowed.
-        // (TypedDict and tuple discriminated union narrowing.)
+        // For subscript or attribute expressions on either side, the base can also be narrowed.
+        // (TypedDict, tuple, and object discriminated union narrowing.)
         for expr in std::iter::once(&*expr_compare.left).chain(&expr_compare.comparators) {
             if let ast::Expr::Subscript(subscript) = expr.expression_value()
                 && let Some(place_expr) = PlaceExpr::try_from_expr(&subscript.value)
+                && let Some(place) = self.places.place_id((&place_expr).into())
+            {
+                places.insert(place);
+            }
+            if let ast::Expr::Attribute(attribute) = expr.expression_value()
+                && let Some(place_expr) = PlaceExpr::try_from_expr(&attribute.value)
                 && let Some(place) = self.places.place_id((&place_expr).into())
             {
                 places.insert(place);

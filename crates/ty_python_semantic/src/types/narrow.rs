@@ -1354,7 +1354,7 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
             // For `!=`, we use equality semantics on the `else` branch (is_positive=false).
             let constrain_with_equality = is_positive == (ops[0] == ast::CmpOp::Eq);
 
-            let mut narrow_subscript = |subscript: &ast::ExprSubscript, other_type: Type<'db>| {
+            let narrow_subscript = |subscript: &ast::ExprSubscript, other_type: Type<'db>| {
                 let value_type = inference.expression_type(&*subscript.value);
                 let slice_type = inference.expression_type(&*subscript.slice);
 
@@ -1365,12 +1365,7 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
                     other_type,
                     constrain_with_equality,
                 ) {
-                    constraints
-                        .entry(place)
-                        .and_modify(|existing| {
-                            *existing = existing.merge_constraint_and(constraint.clone());
-                        })
-                        .or_insert(constraint);
+                    Some((place, constraint))
                 } else if let Some((place, constraint)) = self.narrow_tuple_subscript(
                     value_type,
                     &subscript.value,
@@ -1378,21 +1373,59 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
                     other_type,
                     constrain_with_equality,
                 ) {
-                    constraints
-                        .entry(place)
-                        .and_modify(|existing| {
-                            *existing = existing.merge_constraint_and(constraint.clone());
-                        })
-                        .or_insert(constraint);
+                    Some((place, constraint))
+                } else {
+                    None
                 }
             };
 
-            if let ast::Expr::Subscript(subscript) = left.expression_value() {
-                narrow_subscript(subscript, inference.expression_type(&comparators[0]));
+            let narrow_attribute = |attribute: &ast::ExprAttribute, other_type: Type<'db>| {
+                let value_type = inference.expression_type(&*attribute.value);
+
+                self.narrow_attribute_tag(
+                    value_type,
+                    &attribute.value,
+                    attribute.attr.as_str(),
+                    other_type,
+                    constrain_with_equality,
+                )
+            };
+
+            let mut insert_constraint = |place, constraint: NarrowingConstraint<'db>| {
+                constraints
+                    .entry(place)
+                    .and_modify(|existing| {
+                        *existing = existing.merge_constraint_and(constraint.clone());
+                    })
+                    .or_insert(constraint);
+            };
+
+            if let ast::Expr::Subscript(subscript) = left.expression_value()
+                && let Some((place, constraint)) =
+                    narrow_subscript(subscript, inference.expression_type(&comparators[0]))
+            {
+                insert_constraint(place, constraint);
             }
 
-            if let ast::Expr::Subscript(subscript) = comparators[0].expression_value() {
-                narrow_subscript(subscript, inference.expression_type(&**left));
+            if let ast::Expr::Subscript(subscript) = comparators[0].expression_value()
+                && let Some((place, constraint)) =
+                    narrow_subscript(subscript, inference.expression_type(&**left))
+            {
+                insert_constraint(place, constraint);
+            }
+
+            if let ast::Expr::Attribute(attribute) = left.expression_value()
+                && let Some((place, constraint)) =
+                    narrow_attribute(attribute, inference.expression_type(&comparators[0]))
+            {
+                insert_constraint(place, constraint);
+            }
+
+            if let ast::Expr::Attribute(attribute) = comparators[0].expression_value()
+                && let Some((place, constraint)) =
+                    narrow_attribute(attribute, inference.expression_type(&**left))
+            {
+                insert_constraint(place, constraint);
             }
         }
 
@@ -2096,6 +2129,57 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
         Some((place, NarrowingConstraint::intersection(intersection)))
     }
 
+    /// Narrow tagged unions of objects with `Literal` attributes.
+    ///
+    /// Given an attribute expression like `union.tag` where `union` is a union whose variants have
+    /// literal-valued tag attributes, and a comparison value like `"foo"`, this method creates a
+    /// replacement constraint on `union` that narrows it based on the tag value.
+    fn narrow_attribute_tag(
+        &self,
+        value_type: Type<'db>,
+        value_expr: &ast::Expr,
+        attribute_name: &str,
+        rhs_type: Type<'db>,
+        constrain_with_equality: bool,
+    ) -> Option<(ScopedPlaceId, NarrowingConstraint<'db>)> {
+        let Type::Union(union) = value_type.resolve_type_alias(self.db) else {
+            return None;
+        };
+        let place_expr = PlaceExpr::try_from_expr(value_expr)?;
+
+        if !is_supported_tag_literal(rhs_type) {
+            return None;
+        }
+
+        if constrain_with_equality
+            && !all_matching_attributes_have_literal_types(self.db, value_type, attribute_name)
+        {
+            return None;
+        }
+
+        let filtered = union.filter(self.db, |element| {
+            let Some(attribute_type) = element
+                .member(self.db, attribute_name)
+                .ignore_possibly_undefined()
+            else {
+                return true;
+            };
+
+            if constrain_with_equality {
+                !attribute_type.is_disjoint_from(self.db, rhs_type)
+            } else {
+                !attribute_type.is_subtype_of(self.db, rhs_type)
+            }
+        });
+
+        (filtered != value_type).then(|| {
+            (
+                self.expect_place(&place_expr),
+                NarrowingConstraint::replacement(filtered),
+            )
+        })
+    }
+
     /// Narrow tagged unions of tuples with `Literal` elements.
     ///
     /// Given a subscript expression like `t[0]` where `t` is a union of tuple types, and a
@@ -2310,6 +2394,30 @@ fn all_matching_typeddict_fields_have_literal_types<'db>(
                 ty.display(db)
             )
         }
+    }
+}
+
+fn all_matching_attributes_have_literal_types<'db>(
+    db: &'db dyn Db,
+    ty: Type<'db>,
+    attribute_name: &str,
+) -> bool {
+    let matching_attribute_is_literal = |ty: Type<'db>| {
+        ty.member(db, attribute_name)
+            .ignore_possibly_undefined()
+            .is_none_or(is_supported_tag_literal)
+    };
+
+    match ty.resolve_type_alias(db) {
+        Type::Union(union) => union.elements(db).iter().all(|element| {
+            all_matching_attributes_have_literal_types(db, *element, attribute_name)
+        }),
+        Type::Intersection(intersection) => intersection
+            .positive(db)
+            .iter()
+            .copied()
+            .all(matching_attribute_is_literal),
+        other => matching_attribute_is_literal(other),
     }
 }
 
