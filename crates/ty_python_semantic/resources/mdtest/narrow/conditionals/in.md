@@ -5,7 +5,7 @@
 ```py
 def _(x: int):
     if x in (1, 2, 3):
-        reveal_type(x)  # revealed: int
+        reveal_type(x)  # revealed: Literal[1, 2, 3]
     else:
         reveal_type(x)  # revealed: int
 ```
@@ -13,7 +13,7 @@ def _(x: int):
 ```py
 def _(x: str):
     if x in ("a", "b", "c"):
-        reveal_type(x)  # revealed: str
+        reveal_type(x)  # revealed: Literal["a", "b", "c"]
     else:
         reveal_type(x)  # revealed: str
 ```
@@ -102,7 +102,7 @@ def _(x: Foo):
 ```py
 def _(x: str):
     if x in "abc":
-        reveal_type(x)  # revealed: str
+        reveal_type(x)  # revealed: Literal["a", "b", "c"]
     else:
         reveal_type(x)  # revealed: str
 ```

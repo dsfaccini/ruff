@@ -1042,18 +1042,30 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
     // since `eq` and `ne` are equivalent to `in` and `not in` with only one element in the RHS.
     fn evaluate_expr_in(&mut self, lhs_ty: Type<'db>, rhs_ty: Type<'db>) -> Option<Type<'db>> {
         let lhs_ty = lhs_ty.resolve_type_alias(self.db);
+        let rhs_values = rhs_ty
+            .try_iterate(self.db)
+            .ok()?
+            .homogeneous_element_type(self.db);
+
+        let should_narrow_to_rhs_values = |lhs_ty: Type<'db>| -> bool {
+            matches!(
+                lhs_ty,
+                Type::NominalInstance(instance)
+                    if matches!(
+                        instance.known_class(self.db),
+                        Some(KnownClass::Object | KnownClass::Str | KnownClass::Int | KnownClass::Bytes)
+                    )
+            ) && rhs_values.is_subtype_of(self.db, lhs_ty)
+        };
 
         if lhs_ty.is_single_valued(self.db) || lhs_ty.is_union_of_single_valued(self.db) {
-            rhs_ty
-                .try_iterate(self.db)
-                .ok()
-                .map(|iterable| iterable.homogeneous_element_type(self.db))
+            Some(rhs_values)
+        } else if (rhs_values.is_single_valued(self.db)
+            || rhs_values.is_union_of_single_valued(self.db))
+            && should_narrow_to_rhs_values(lhs_ty)
+        {
+            Some(rhs_values)
         } else if lhs_ty.is_union_with_single_valued(self.db) {
-            let rhs_values = rhs_ty
-                .try_iterate(self.db)
-                .ok()?
-                .homogeneous_element_type(self.db);
-
             let mut builder = UnionBuilder::new(self.db);
 
             // Add the narrowed values from the RHS first, to keep literals before broader types.
@@ -1080,6 +1092,10 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
                 }
             }
             Some(builder.build())
+        } else if rhs_values.is_single_valued(self.db)
+            || rhs_values.is_union_of_single_valued(self.db)
+        {
+            self.evaluate_expr_eq(lhs_ty, rhs_values)
         } else {
             None
         }
