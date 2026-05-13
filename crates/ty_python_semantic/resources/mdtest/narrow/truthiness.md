@@ -515,6 +515,31 @@ def test() -> None:
     print(p["nonexistent"])
 ```
 
+Key membership narrows a union of `TypedDict`s to members that define that key:
+
+```py
+from typing import TypedDict
+
+class TextPart(TypedDict):
+    text: str
+
+class FunctionPart(TypedDict):
+    function_call: str
+
+class FilePart(TypedDict):
+    file_data: bytes
+
+def _(part: TextPart | FunctionPart | FilePart) -> None:
+    if "text" in part:
+        reveal_type(part)  # revealed: TextPart
+        reveal_type(part["text"])  # revealed: str
+    elif "function_call" in part:
+        reveal_type(part)  # revealed: FunctionPart
+        reveal_type(part["function_call"])  # revealed: str
+    else:
+        reveal_type(part)  # revealed: FilePart
+```
+
 ## Truthiness narrowing of `NewType`s
 
 ```py

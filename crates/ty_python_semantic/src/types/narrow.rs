@@ -1398,15 +1398,18 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
             && is_or_contains_typeddict(self.db, rhs_type)
         {
             let is_negative_check = is_positive == (ops[0] == ast::CmpOp::NotIn);
-            if is_negative_check {
-                let requires_key = |td: TypedDictType<'db>| -> bool {
-                    td.items(self.db)
-                        .get(key.value(self.db))
-                        .is_some_and(TypedDictField::is_required)
-                };
+            let key_name = key.value(self.db);
+            let requires_key = |td: TypedDictType<'db>| -> bool {
+                td.items(self.db)
+                    .get(key_name)
+                    .is_some_and(TypedDictField::is_required)
+            };
+            let has_key =
+                |td: TypedDictType<'db>| -> bool { td.items(self.db).contains_key(key_name) };
 
-                let resolved_rhs_type = rhs_type.resolve_type_alias(self.db);
+            let resolved_rhs_type = rhs_type.resolve_type_alias(self.db);
 
+            let narrowed = if is_negative_check {
                 let narrowed = match resolved_rhs_type {
                     Type::TypedDict(td) => {
                         if requires_key(td) {
@@ -1443,23 +1446,59 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
                     }
                     _ => resolved_rhs_type,
                 };
-
-                if narrowed != resolved_rhs_type {
-                    let constraint = NarrowingConstraint::replacement(narrowed);
-
-                    let comparator_place = PlaceExpr::try_from_expr(&comparators[0])
-                        .and_then(|place_expr| self.places().place_id(&place_expr));
-                    if let Some(place) = comparator_place {
-                        constraints.insert(place, constraint.clone());
+                (narrowed != resolved_rhs_type).then_some(narrowed)
+            } else {
+                let narrowed = match resolved_rhs_type {
+                    Type::TypedDict(td) => {
+                        if has_key(td) {
+                            resolved_rhs_type
+                        } else {
+                            Type::Never
+                        }
                     }
-
-                    let value_place = PlaceExpr::try_from_expr(rhs_expr)
-                        .and_then(|place_expr| self.places().place_id(&place_expr));
-                    if value_place != comparator_place
-                        && let Some(place) = value_place
-                    {
-                        constraints.insert(place, constraint);
+                    Type::Intersection(intersection) => {
+                        if intersection
+                            .positive(self.db)
+                            .iter()
+                            .copied()
+                            .filter_map(Type::as_typed_dict)
+                            .any(has_key)
+                        {
+                            resolved_rhs_type
+                        } else {
+                            Type::Never
+                        }
                     }
+                    Type::Union(union) => union.filter(self.db, |ty| match ty {
+                        Type::TypedDict(td) => has_key(*td),
+                        Type::Intersection(intersection) => intersection
+                            .positive(self.db)
+                            .iter()
+                            .copied()
+                            .filter_map(Type::as_typed_dict)
+                            .any(has_key),
+                        _ => true,
+                    }),
+                    _ => resolved_rhs_type,
+                };
+                (narrowed != resolved_rhs_type).then_some(narrowed)
+            };
+
+            if let Some(narrowed) = narrowed {
+                let constraint = NarrowingConstraint::replacement(narrowed);
+
+                let comparator_place = PlaceExpr::try_from_expr(&comparators[0])
+                    .and_then(|place_expr| self.places().place_id(&place_expr));
+                if let Some(place) = comparator_place {
+                    constraints.insert(place, constraint.clone());
+                }
+
+                let value_place = PlaceExpr::try_from_expr(rhs_expr)
+                    .and_then(|place_expr| self.places().place_id(&place_expr));
+                if value_place != comparator_place
+                    && let Some(place) = value_place
+                {
+                    constraints.insert(place, constraint);
                 }
             }
         }
