@@ -246,6 +246,25 @@ async def f(fn: Callable[[int], int | Awaitable[int]]) -> None:
         reveal_type(await result)  # revealed: object
 ```
 
+When `TypeIs[Awaitable[Any]]` is applied to a union that already has a known awaitable arm, preserve
+that arm instead of intersecting all non-awaitable arms with `Awaitable[object]`:
+
+```py
+import inspect
+from typing import Awaitable, Generic, TypeVar
+
+T = TypeVar("T")
+
+class Box(Generic[T]): ...
+
+async def f(x: Box[T] | Awaitable[Box[T]] | None) -> Box[T] | None:
+    if inspect.isawaitable(x):
+        reveal_type(x)  # revealed: Awaitable[Box[T@f]]
+        x = await x
+    reveal_type(x)  # revealed: Box[T@f] | None
+    return x
+```
+
 ## Awaiting intersection types (Python 3.12 or lower)
 
 ```toml

@@ -1744,14 +1744,39 @@ impl<'db, 'ast> NarrowingConstraintsBuilder<'db, 'ast> {
         let place_and_constraint = match return_ty {
             Type::TypeIs(type_is) => {
                 let (_, place) = type_is.place_info(self.db)?;
-                Some((
-                    place,
-                    NarrowingConstraint::intersection(
-                        type_is
-                            .return_type(self.db)
-                            .negate_if(self.db, !is_positive),
-                    ),
-                ))
+                let type_is_return = type_is.return_type(self.db);
+                let constraint = if is_positive {
+                    let current_ty = expr_call
+                        .arguments
+                        .iter_source_order()
+                        .filter_map(|arg_or_keyword| {
+                            let expr = arg_or_keyword.value();
+                            let place_expr = PlaceExpr::try_from_expr(expr)?;
+                            (self.places().place_id(&place_expr)? == place)
+                                .then(|| inference.expression_type(expr))
+                        })
+                        .next();
+
+                    if let Some(Type::Union(union)) =
+                        current_ty.map(|ty| ty.resolve_type_alias(self.db))
+                    {
+                        let type_is_argument = type_is.type_argument(self.db);
+                        let filtered = union.filter(self.db, |element| {
+                            element.is_assignable_to(self.db, type_is_argument)
+                        });
+                        if filtered.is_never() {
+                            NarrowingConstraint::intersection(type_is_return)
+                        } else {
+                            NarrowingConstraint::replacement(filtered)
+                        }
+                    } else {
+                        NarrowingConstraint::intersection(type_is_return)
+                    }
+                } else {
+                    NarrowingConstraint::intersection(type_is_return.negate(self.db))
+                };
+
+                Some((place, constraint))
             }
             // TypeGuard only narrows in the positive case
             Type::TypeGuard(type_guard) if is_positive => {
