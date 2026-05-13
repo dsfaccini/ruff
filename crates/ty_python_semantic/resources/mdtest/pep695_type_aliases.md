@@ -289,8 +289,29 @@ T = TypeVar("T")
 IntAndT = TypeAliasType("IntAndT", tuple[int, T], type_params=(T,))
 
 def f(x: IntAndT[str]) -> None:
-    # TODO: This should be `tuple[int, str]`
-    reveal_type(x)  # revealed: Unknown
+    reveal_type(x)  # revealed: tuple[int, str]
+```
+
+### Nested generic manual alias
+
+```py
+from typing_extensions import Callable, TypeAliasType, TypeVar
+
+T = TypeVar("T")
+
+OutputTypeOrFunction = TypeAliasType(
+    "OutputTypeOrFunction",
+    type[T] | Callable[..., T],
+    type_params=(T,),
+)
+OutputSpec = TypeAliasType(
+    "OutputSpec",
+    OutputTypeOrFunction[T] | list[OutputTypeOrFunction[T]],
+    type_params=(T,),
+)
+
+def f(x: OutputSpec[int]) -> None:
+    reveal_type(x)  # revealed: type[int] | ((...) -> int) | list[OutputTypeOrFunction[int]]
 ```
 
 ### Generic value binds type variables to alias definition

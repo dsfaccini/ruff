@@ -6095,12 +6095,21 @@ impl<'db> Type<'db> {
 
             Type::TypeAlias(alias) => {
                 visitor.visit(self, || {
-                    alias.value_type(db).find_legacy_typevars_impl(
-                        db,
-                        binding_context,
-                        typevars,
-                        visitor,
-                    );
+                    if let Some(specialization) = alias.specialization(db) {
+                        specialization.find_legacy_typevars_impl(
+                            db,
+                            binding_context,
+                            typevars,
+                            visitor,
+                        );
+                    } else {
+                        alias.value_type(db).find_legacy_typevars_impl(
+                            db,
+                            binding_context,
+                            typevars,
+                            visitor,
+                        );
+                    }
                 });
             }
 

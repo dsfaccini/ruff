@@ -3839,6 +3839,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 db,
                 ast::name::Name::new(name),
                 definition,
+                None,
             )),
         ))
     }
@@ -3853,7 +3854,10 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         // in the alias value are bound to the alias definition.
         let previous_context = self.typevar_binding_context.replace(definition);
 
-        self.infer_type_expression(&arguments.args[1]);
+        self.infer_type_expression_with_state(
+            &arguments.args[1],
+            DeferredExpressionState::Deferred,
+        );
         // Infer keyword arguments (e.g. `type_params`) so their types are stored.
         for keyword in &arguments.keywords {
             self.infer_expression(&keyword.value, TypeContext::default());
