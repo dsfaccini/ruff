@@ -47,6 +47,21 @@ class Foo: ...
 reveal_type(get_foo())  # revealed: Foo
 ```
 
+## Deferred class annotations prefer globals over class-body attributes
+
+```py
+from __future__ import annotations
+
+import pathlib
+
+Alias = str
+
+class C:
+    pathlib: pathlib.Path | None = None
+    Alias = int
+    value: Alias = ""
+```
+
 ## Deferred self-reference annotations in a class definition
 
 ```toml

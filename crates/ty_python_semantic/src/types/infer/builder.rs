@@ -8038,6 +8038,15 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         // If we're inferring types of deferred expressions, look them up from end-of-scope.
         if self.is_deferred() {
+            if scope.node(db).scope_kind().is_class()
+                && let Some(symbol) = expr.as_symbol()
+            {
+                let global_place = explicit_global_symbol(db, self.file(), symbol.name());
+                if !global_place.is_undefined() {
+                    return (global_place.place, None);
+                }
+            }
+
             let place = if let Some(place_id) = place_table.place_id(expr) {
                 place_from_bindings(db, use_def.reachable_bindings(place_id)).place
             } else {
