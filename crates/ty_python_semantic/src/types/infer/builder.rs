@@ -94,11 +94,11 @@ use crate::types::{
     BoundTypeVarInstance, CallDunderError, CallableBinding, CallableType, CallableTypes, ClassType,
     DynamicType, InferenceFlags, InternedConstraintSet, InternedType, IntersectionBuilder,
     IntersectionType, KnownClass, KnownInstanceType, KnownUnion, LiteralValueTypeKind,
-    MemberLookupPolicy, ParamSpecAttrKind, Parameter, ParameterForm, Parameters, Signature,
-    SpecialFormType, SubclassOfType, Type, TypeAliasType, TypeAndQualifiers, TypeContext,
-    TypeQualifiers, TypeVarBoundOrConstraints, TypeVarKind, TypeVarVariance, TypedDictType,
-    UnionAccumulator, UnionBuilder, UnionType, binding_type, infer_complete_scope_types,
-    infer_scope_types, todo_type,
+    MemberLookupPolicy, ParamSpecAttrKind, Parameter, ParameterForm, Parameters, SentinelInstance,
+    Signature, SpecialFormType, SubclassOfType, Type, TypeAliasType, TypeAndQualifiers,
+    TypeContext, TypeQualifiers, TypeVarBoundOrConstraints, TypeVarKind, TypeVarVariance,
+    TypedDictType, UnionAccumulator, UnionBuilder, UnionType, binding_type,
+    infer_complete_scope_types, infer_scope_types, todo_type,
 };
 use crate::{AnalysisSettings, Db, FxIndexSet, Program};
 use ty_python_core::ast_ids::ScopedUseId;
@@ -3462,6 +3462,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             Some(KnownClass::TypeAliasType) => {
                                 self.infer_typealiastype_call(target, call_expr, definition)
                             }
+                            Some(KnownClass::Sentinel) => self
+                                .infer_sentinel_expression(target, call_expr, definition)
+                                .unwrap_or_else(|| {
+                                    self.infer_call_expression_impl(call_expr, callable_type, tcx)
+                                }),
                             Some(_) | None => {
                                 self.infer_call_expression_impl(call_expr, callable_type, tcx)
                             }
@@ -3592,6 +3597,94 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             definition,
             None,
         )))
+    }
+
+    fn infer_sentinel_expression(
+        &mut self,
+        target: &ast::Expr,
+        call_expr: &ast::ExprCall,
+        definition: Definition<'db>,
+    ) -> Option<Type<'db>> {
+        if !self.sentinel_definition_scope_is_supported() {
+            return None;
+        }
+
+        let ast::Expr::Name(ast::ExprName {
+            id: target_name, ..
+        }) = target
+        else {
+            return None;
+        };
+
+        let ast::Arguments {
+            args,
+            keywords,
+            range: _,
+            node_index: _,
+        } = &call_expr.arguments;
+
+        if args.iter().any(ast::Expr::is_starred_expr) {
+            return None;
+        }
+
+        let (name_arg, mut repr_arg) = match &**args {
+            [name_arg] => (name_arg, None),
+            [name_arg, repr_arg] => (name_arg, Some(repr_arg)),
+            _ => return None,
+        };
+
+        for keyword in keywords {
+            let Some(keyword_name) = &keyword.arg else {
+                return None;
+            };
+
+            if keyword_name.as_str() != "repr" || repr_arg.is_some() {
+                return None;
+            }
+
+            repr_arg = Some(&keyword.value);
+        }
+
+        if !matches!(name_arg, ast::Expr::StringLiteral(_)) {
+            return None;
+        }
+
+        let Some(repr_arg) = repr_arg else {
+            return Some(Type::KnownInstance(KnownInstanceType::Sentinel(
+                SentinelInstance::new(self.db(), target_name.clone(), definition),
+            )));
+        };
+
+        if !matches!(repr_arg, ast::Expr::StringLiteral(_)) && !repr_arg.is_none_literal_expr() {
+            return None;
+        }
+
+        Some(Type::KnownInstance(KnownInstanceType::Sentinel(
+            SentinelInstance::new(self.db(), target_name.clone(), definition),
+        )))
+    }
+
+    fn sentinel_definition_scope_is_supported(&self) -> bool {
+        let db = self.db();
+        let mut scope_id = self.scope.file_scope_id(db);
+
+        loop {
+            let scope = self.index.scope(scope_id);
+            match scope.node().scope_kind() {
+                ScopeKind::Module => return true,
+                ScopeKind::Class => {}
+                ScopeKind::Function
+                | ScopeKind::Lambda
+                | ScopeKind::Comprehension
+                | ScopeKind::TypeAlias
+                | ScopeKind::TypeParams => return false,
+            }
+
+            let Some(parent) = scope.parent() else {
+                return false;
+            };
+            scope_id = parent;
+        }
     }
 
     fn infer_assignment_deferred(&mut self, target: &ast::Expr, value: &'ast ast::Expr) {
@@ -5934,13 +6027,70 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         } = set;
 
         let elts = elts.iter().map(|elt| [Some(elt)]).collect_vec();
-        let mut infer_elt_ty =
-            |builder: &mut Self, (_, elt, tcx)| builder.infer_expression(elt, tcx);
+        let fallback_tcx = self.incomplete_typed_dict_key_context(set, tcx);
+        let mut infer_elt_ty = |builder: &mut Self, arg: ArgExpr<'db, '_>| {
+            let (_, elt, elt_tcx) = arg;
+            builder.infer_set_element(elt, elt_tcx, fallback_tcx)
+        };
 
         self.infer_collection_literal(KnownClass::Set, &elts, &mut infer_elt_ty, tcx)
             .unwrap_or_else(|| {
                 KnownClass::Set.to_specialized_instance(self.db(), &[Type::unknown()])
             })
+    }
+
+    /// Infers a set element, optionally with a fallback context for an incomplete `TypedDict` key.
+    ///
+    /// When normal set element context is available, semantic inference keeps that context. If a
+    /// `TypedDict` key fallback is also available, it is only added to the stored expected type used
+    /// by IDE string-literal completions.
+    fn infer_set_element(
+        &mut self,
+        elt: &ast::Expr,
+        elt_tcx: TypeContext<'db>,
+        fallback_tcx: TypeContext<'db>,
+    ) -> Type<'db> {
+        let inference_tcx = if elt_tcx.annotation.is_some() {
+            elt_tcx
+        } else {
+            fallback_tcx
+        };
+        let inferred_ty = self.infer_expression(elt, inference_tcx);
+
+        // `expected_types` is IDE completion metadata. If normal set inference already has a
+        // string-literal context, preserve that semantic context for inference while also offering
+        // the transient `TypedDict` key fallback as a completion candidate.
+        if let (Some(elt_ty), Some(fallback_ty)) = (elt_tcx.annotation, fallback_tcx.annotation) {
+            self.store_expected_type(
+                elt,
+                UnionType::from_two_elements(self.db(), elt_ty, fallback_ty),
+            );
+        }
+
+        inferred_ty
+    }
+
+    /// Returns a fallback type context for completing a `TypedDict` key while editing.
+    ///
+    /// While editing `{"key": value}` as a `TypedDict` literal, `{"key"}` parses as a set
+    /// until the colon is typed. This preserves key completions in that transient state.
+    fn incomplete_typed_dict_key_context(
+        &self,
+        set: &ast::ExprSet,
+        tcx: TypeContext<'db>,
+    ) -> TypeContext<'db> {
+        let [elt] = set.elts.as_slice() else {
+            return TypeContext::default();
+        };
+
+        if !elt.is_string_literal_expr() {
+            return TypeContext::default();
+        }
+
+        TypeContext::new(
+            tcx.annotation
+                .and_then(|annotation| self.typed_dict_key_expected_type(annotation)),
+        )
     }
 
     fn infer_dict_expression(&mut self, dict: &ast::ExprDict, tcx: TypeContext<'db>) -> Type<'db> {
@@ -6034,6 +6184,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             item_types
                 .get(&elt.node_index().load())
                 .copied()
+                .or_else(|| builder.try_expression_type(elt))
                 .unwrap_or_else(|| builder.infer_expression(elt, tcx))
         };
 
@@ -7135,7 +7286,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     ) -> CallArguments<'a, 'db> {
         let call_arguments =
             CallArguments::from_arguments(arguments, |arg_or_keyword, splatted_value| {
-                let ty = self.infer_expression(splatted_value, TypeContext::default());
+                let ty = self.get_or_infer_expression(splatted_value, TypeContext::default());
                 if let ast::ArgOrKeyword::Arg(argument) = arg_or_keyword
                     && argument.is_starred_expr()
                 {
@@ -7277,11 +7428,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             return self.infer_typeddict_call_expression(call_expression, None);
         }
 
-        // We don't call `Type::try_call`, because we want to perform type inference on the
-        // arguments after matching them to parameters, but before checking that the argument types
-        // are assignable to any parameter annotations.
-        let mut call_arguments = self.prepare_call_arguments(arguments);
-
         if callable_type.is_notimplemented(self.db()) {
             if let Some(builder) = self
                 .context
@@ -7299,6 +7445,34 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             }
             return Type::unknown();
         }
+
+        let class = match callable_type {
+            Type::ClassLiteral(class) => Some(ClassType::NonGeneric(class)),
+            Type::GenericAlias(generic) => Some(ClassType::Generic(generic)),
+            Type::SubclassOf(subclass) => subclass.subclass_of().into_class(self.db()),
+            _ => None,
+        };
+
+        // Prepare `TypedDict` constructor calls before variadic argument setup so field-directed
+        // value inference becomes canonical before `**kwargs` expressions are inferred.
+        let has_prepared_typed_dict_constructor = class
+            .filter(|class| class.is_typed_dict(self.db()))
+            .map(|class| {
+                let typed_dict = TypedDictType::new(class);
+                let form = TypedDictConstructorForm::from_arguments(arguments);
+                self.prepare_typed_dict_constructor(
+                    typed_dict,
+                    form,
+                    arguments,
+                    func.as_ref().into(),
+                );
+            })
+            .is_some();
+
+        // We don't call `Type::try_call`, because we want to perform type inference on the
+        // arguments after matching them to parameters, but before checking that the argument types
+        // are assignable to any parameter annotations.
+        let mut call_arguments = self.prepare_call_arguments(arguments);
 
         // Special handling for `TypedDict` method calls
         if let ast::Expr::Attribute(ast::ExprAttribute { value, attr, .. }) = func.as_ref() {
@@ -7418,13 +7592,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             _ => {}
         }
 
-        let class = match callable_type {
-            Type::ClassLiteral(class) => Some(ClassType::NonGeneric(class)),
-            Type::GenericAlias(generic) => Some(ClassType::Generic(generic)),
-            Type::SubclassOf(subclass) => subclass.subclass_of().into_class(self.db()),
-            _ => None,
-        };
-
         if let Some(class) = class {
             // It might look odd here that we emit an error for class-literals and generic aliases but not
             // `type[]` types. But it's deliberate! The typing spec explicitly mandates that `type[]` types
@@ -7500,22 +7667,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             call_expression,
             &bindings,
         );
-
-        // Prepare `TypedDict` constructor calls before general argument inference so the field
-        // type context becomes the canonical inference for constructor values.
-        let has_prepared_typed_dict_constructor = class
-            .filter(|class| class.is_typed_dict(self.db()))
-            .map(|class| {
-                let typed_dict = TypedDictType::new(class);
-                let form = TypedDictConstructorForm::from_arguments(arguments);
-                self.prepare_typed_dict_constructor(
-                    typed_dict,
-                    form,
-                    arguments,
-                    func.as_ref().into(),
-                );
-            })
-            .is_some();
 
         let bindings_result = self.infer_and_check_argument_types(
             ArgumentsIter::from_ast(arguments),

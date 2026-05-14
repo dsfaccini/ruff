@@ -1285,7 +1285,8 @@ impl<'db> FunctionType<'db> {
     /// Were this not a salsa query, then the calling query
     /// would depend on the function's AST and rerun for every change in that file.
     #[salsa::tracked(
-        returns(ref), cycle_initial=last_definition_signature_cycle_initial,
+        returns(ref),
+        cycle_initial=|_, _, _|Signature::bottom(),
         heap_size=ruff_memory_usage::heap_size,
     )]
     pub(crate) fn last_definition_signature(self, db: &'db dyn Db) -> Signature<'db> {
@@ -1298,7 +1299,8 @@ impl<'db> FunctionType<'db> {
     /// The `return_callable_typevar_scope` controls whether type variables that only appear in a
     /// return-position `Callable` stay bound to the function or move to the returned callable.
     #[salsa::tracked(
-        returns(ref), cycle_initial=last_definition_raw_signature_cycle_initial,
+        returns(ref),
+        cycle_initial=|_, _, _, _|Signature::bottom(),
         heap_size=ruff_memory_usage::heap_size,
     )]
     pub(crate) fn last_definition_raw_signature(
@@ -1722,23 +1724,6 @@ fn is_instance_truthiness<'db>(
     }
 }
 
-fn last_definition_signature_cycle_initial<'db>(
-    _db: &'db dyn Db,
-    _id: salsa::Id,
-    _function: FunctionType<'db>,
-) -> Signature<'db> {
-    Signature::bottom()
-}
-
-fn last_definition_raw_signature_cycle_initial<'db>(
-    _db: &'db dyn Db,
-    _id: salsa::Id,
-    _function: FunctionType<'db>,
-    _return_callable_typevar_scope: ReturnCallableTypeVarScope,
-) -> Signature<'db> {
-    Signature::bottom()
-}
-
 /// Returns `true` if the function body is stub-like, ignoring a leading docstring.
 pub(crate) fn function_has_stub_body(node: &ast::StmtFunctionDef) -> bool {
     let suite = ast::helpers::body_without_leading_docstring(&node.body);
@@ -1927,6 +1912,20 @@ pub enum KnownFunction {
     Unpack,
     /// `types.new_class`
     NewClass,
+}
+
+fn call_argument_node<'a>(
+    call_expression: &'a ast::ExprCall,
+    name: &str,
+    position: usize,
+) -> Option<ast::AnyNodeRef<'a>> {
+    call_expression
+        .arguments
+        .find_argument(name, position)
+        .map(|argument| match argument {
+            ast::ArgOrKeyword::Arg(expr) => ast::AnyNodeRef::from(expr),
+            ast::ArgOrKeyword::Keyword(keyword) => ast::AnyNodeRef::from(keyword),
+        })
 }
 
 impl KnownFunction {
@@ -2139,17 +2138,7 @@ impl KnownFunction {
                 let truthiness = match parameter_ty.try_bool(db) {
                     Ok(truthiness) => truthiness,
                     Err(err) => {
-                        let condition = call_expression
-                            .arguments
-                            .find_argument("condition", 0)
-                            .map(|argument| match argument {
-                                ruff_python_ast::ArgOrKeyword::Arg(expr) => {
-                                    ast::AnyNodeRef::from(expr)
-                                }
-                                ruff_python_ast::ArgOrKeyword::Keyword(keyword) => {
-                                    ast::AnyNodeRef::from(keyword)
-                                }
-                            })
+                        let condition = call_argument_node(call_expression, "condition", 0)
                             .unwrap_or(ast::AnyNodeRef::from(call_expression));
 
                         err.report_diagnostic(context, condition);
@@ -2184,13 +2173,14 @@ impl KnownFunction {
                             parameter_ty = parameter_ty.display(db)
                         ))
                     };
-                    diagnostic.annotate(
-                        Annotation::secondary(context.span(&call_expression.arguments.args[0]))
-                            .message(format_args!(
+                    if let Some(condition) = call_argument_node(call_expression, "condition", 0) {
+                        diagnostic.annotate(
+                            Annotation::secondary(context.span(condition)).message(format_args!(
                                 "Inferred type of argument is `{}`",
                                 parameter_ty.display(db)
                             )),
-                    );
+                        );
+                    }
                 }
             }
 
